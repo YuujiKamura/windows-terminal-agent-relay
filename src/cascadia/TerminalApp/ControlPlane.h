@@ -36,6 +36,7 @@ namespace winrt::TerminalApp::implementation
 
         struct StateSnapshot
         {
+            std::string title;
             std::string pwd;
             bool hasSelection{ false };
             bool atPrompt{ false };
@@ -92,6 +93,9 @@ namespace winrt::TerminalApp::implementation
 
         std::thread _serverThread;
         std::atomic<bool> _stop{ false };
+        // Shared cancellation token: survives ControlPlane destruction to prevent
+        // use-after-free in queued UI-thread lambdas (T3 fix).
+        std::shared_ptr<std::atomic<bool>> _cancelled{ std::make_shared<std::atomic<bool>>(false) };
 
         std::mutex _pendingMutex;
         std::vector<PendingInput> _pendingInputs;

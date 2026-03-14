@@ -185,6 +185,8 @@ ControlPlane::ControlPlane(TerminalPage& page) :
 ControlPlane::~ControlPlane()
 {
     _stop.store(true);
+    // T3 fix: Cancel any queued UI-thread lambdas before destroying members.
+    _cancelled->store(true);
     {
         std::lock_guard<std::mutex> guard(_pipeMutex);
         if (_currentPipe != INVALID_HANDLE_VALUE)
@@ -541,7 +543,7 @@ std::string ControlPlane::respondState(std::optional<size_t> tabIndex)
     const auto snapshot = captureState(tabIndex);
     std::ostringstream oss;
     oss << "STATE|" << _sessionName << "|" << _pid << "|" << toHex(reinterpret_cast<uintptr_t>(_hwnd)) << "|";
-    oss << escapeField(toUtf8(_page.Title())) << "|prompt=" << (snapshot.atPrompt ? '1' : '0') << "|selection=" << (snapshot.hasSelection ? '1' : '0');
+    oss << escapeField(snapshot.title) << "|prompt=" << (snapshot.atPrompt ? '1' : '0') << "|selection=" << (snapshot.hasSelection ? '1' : '0');
     oss << "|pwd=" << snapshot.pwd << "|tab_count=" << snapshot.tabCount << "|active_tab=" << snapshot.activeTab << "\n";
     return oss.str();
 }
@@ -663,6 +665,8 @@ ControlPlane::StateSnapshot ControlPlane::captureState(std::optional<size_t> tab
 {
     return runOnUiThread<StateSnapshot>([this, tabIndex]() {
         StateSnapshot snapshot{};
+        // T1 fix: capture Title on UI thread to avoid XAML cross-thread access crash
+        snapshot.title = toUtf8(_page.Title());
         snapshot.tabCount = _page.NumberOfTabs();
         snapshot.activeTab = _page._GetFocusedTabIndex().value_or(0);
         if (const auto tab = getTabImpl(tabIndex))
@@ -677,12 +681,18 @@ ControlPlane::StateSnapshot ControlPlane::captureState(std::optional<size_t> tab
     });
 }
 
-std::string ControlPlane::captureTailContent(size_t) const
+std::string ControlPlane::captureTailContent(size_t /*lines*/) const
 {
-    // ViewportText requires TermControl impl access which is unavailable
-    // from TerminalApp project. Return empty for now.
-    // TODO: expose ViewportText via IDL to enable TAIL support.
-    return std::string();
+    // T5 fix: Use ReadEntireBuffer() (exposed via IDL) instead of impl-only ViewportText().
+    // sliceLastLines() will extract the requested number of trailing lines.
+    return runOnUiThread<std::string>([this]() -> std::string {
+        const auto control = getActiveControl(std::nullopt);
+        if (!control)
+        {
+            return {};
+        }
+        return toUtf8(control.ReadEntireBuffer());
+    });
 }
 
 std::string ControlPlane::captureTabList() const
@@ -896,18 +906,24 @@ void ControlPlane::setWindowFocus() const
 template<typename TResult>
 TResult ControlPlane::runOnUiThread(std::function<TResult()> action) const
 {
-    // Issue #1: Check _stop before dispatching to avoid deadlock during shutdown.
     if (_stop.load())
     {
         return TResult{};
     }
     std::promise<TResult> promise;
     auto future = promise.get_future();
+    // T3 fix: cancellation token prevents use-after-free if lambda executes after ControlPlane destruction.
+    auto cancelled = _cancelled;
     try
     {
-        _dispatcher.RunAsync(CoreDispatcherPriority::Normal, [action = std::move(action), promise = std::move(promise)]() mutable {
+        _dispatcher.RunAsync(CoreDispatcherPriority::Normal, [cancelled, action = std::move(action), promise = std::move(promise)]() mutable {
             try
             {
+                if (cancelled->load())
+                {
+                    promise.set_value(TResult{});
+                    return;
+                }
                 promise.set_value(action());
             }
             catch (...)
@@ -918,10 +934,8 @@ TResult ControlPlane::runOnUiThread(std::function<TResult()> action) const
     }
     catch (...)
     {
-        // Dispatcher may be shut down already
         return TResult{};
     }
-    // Timed wait to avoid deadlock if UI thread is blocked
     if (future.wait_for(std::chrono::seconds(5)) == std::future_status::ready)
     {
         return future.get();
@@ -929,21 +943,25 @@ TResult ControlPlane::runOnUiThread(std::function<TResult()> action) const
     return TResult{};
 }
 
-// Helper: run void action on UI thread (avoids template<void> specialization issues)
 void ControlPlane::runVoidOnUiThread(std::function<void()> action) const
 {
-    // Issue #1: Check _stop before dispatching to avoid deadlock during shutdown.
     if (_stop.load())
     {
         return;
     }
     std::promise<void> promise;
     auto future = promise.get_future();
+    auto cancelled = _cancelled;
     try
     {
-        _dispatcher.RunAsync(CoreDispatcherPriority::Normal, [action = std::move(action), promise = std::move(promise)]() mutable {
+        _dispatcher.RunAsync(CoreDispatcherPriority::Normal, [cancelled, action = std::move(action), promise = std::move(promise)]() mutable {
             try
             {
+                if (cancelled->load())
+                {
+                    promise.set_value();
+                    return;
+                }
                 action();
                 promise.set_value();
             }
@@ -955,9 +973,7 @@ void ControlPlane::runVoidOnUiThread(std::function<void()> action) const
     }
     catch (...)
     {
-        // Dispatcher may be shut down already
         return;
     }
-    // Timed wait to avoid deadlock if UI thread is blocked
     future.wait_for(std::chrono::seconds(5));
 }
