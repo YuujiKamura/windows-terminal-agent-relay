@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <future>
 #include <iomanip>
+#include <sddl.h>
 #include <sstream>
 
 // Use projected types only - do NOT include TermControl impl header
@@ -194,7 +195,25 @@ ControlPlane::~ControlPlane()
     }
     if (_serverThread.joinable())
     {
-        _serverThread.join();
+        // Issue #1: Avoid deadlock when destructor runs on UI thread.
+        // The server thread may be blocked on future.get() waiting for UI dispatch.
+        // Use a timed join: if the thread doesn't finish within 2 seconds, detach it.
+        auto handle = _serverThread.native_handle();
+        auto waitResult = WaitForSingleObject(handle, 2000);
+        if (waitResult == WAIT_OBJECT_0)
+        {
+            _serverThread.join();
+        }
+        else
+        {
+            _serverThread.detach();
+            appendLogLine("control-plane-thread:detached-on-shutdown-timeout");
+        }
+    }
+    if (_logFile.is_open())
+    {
+        appendLogLine("control-plane-log-closed");
+        _logFile.close();
     }
     removeSessionFile();
 }
@@ -251,15 +270,42 @@ void ControlPlane::appendLogLine(std::string line)
 
 HANDLE ControlPlane::createServerPipe() const
 {
-    return CreateNamedPipeA(
+    // Issue #2: Create a security descriptor that restricts pipe access to the current user.
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = FALSE;
+
+    // DACL: allow GENERIC_ALL to the current user only (owner).
+    // "D:(A;;GA;;;OW)" = Allow Generic All to Owner.
+    PSECURITY_DESCRIPTOR pSD = nullptr;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorA(
+            "D:(A;;GA;;;OW)", SDDL_REVISION_1, &pSD, nullptr))
+    {
+        // Fallback: create pipe without explicit security (same as before)
+        return CreateNamedPipeA(
+            _pipePath.c_str(),
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+            PIPE_TYPE_BYTE | PIPE_WAIT,
+            1,
+            static_cast<DWORD>(kMaxReadSize),
+            static_cast<DWORD>(kMaxReadSize),
+            0,
+            nullptr);
+    }
+    sa.lpSecurityDescriptor = pSD;
+
+    auto pipe = CreateNamedPipeA(
         _pipePath.c_str(),
-        PIPE_ACCESS_DUPLEX,
+        PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
         PIPE_TYPE_BYTE | PIPE_WAIT,
         1,
         static_cast<DWORD>(kMaxReadSize),
         static_cast<DWORD>(kMaxReadSize),
         0,
-        nullptr);
+        &sa);
+
+    LocalFree(pSD);
+    return pipe;
 }
 
 void ControlPlane::threadMain()
@@ -275,8 +321,48 @@ void ControlPlane::threadMain()
             std::lock_guard<std::mutex> guard(_pipeMutex);
             _currentPipe = pipe;
         }
-        const auto connected = ConnectNamedPipe(pipe, nullptr) ? true : (GetLastError() == ERROR_PIPE_CONNECTED);
-        if (connected)
+
+        // Issue #3: Use overlapped ConnectNamedPipe with timeout to avoid indefinite blocking.
+        OVERLAPPED ov{};
+        ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        bool connected = false;
+        if (ov.hEvent)
+        {
+            if (ConnectNamedPipe(pipe, &ov))
+            {
+                connected = true;
+            }
+            else
+            {
+                const auto err = GetLastError();
+                if (err == ERROR_PIPE_CONNECTED)
+                {
+                    connected = true;
+                }
+                else if (err == ERROR_IO_PENDING)
+                {
+                    // Wait with 5-second timeout, check _stop periodically
+                    while (!_stop.load())
+                    {
+                        const auto waitResult = WaitForSingleObject(ov.hEvent, 1000);
+                        if (waitResult == WAIT_OBJECT_0)
+                        {
+                            DWORD dummy = 0;
+                            connected = GetOverlappedResult(pipe, &ov, &dummy, FALSE) != 0;
+                            break;
+                        }
+                        // WAIT_TIMEOUT: loop and re-check _stop
+                    }
+                    if (_stop.load() && !connected)
+                    {
+                        CancelIoEx(pipe, &ov);
+                    }
+                }
+            }
+            CloseHandle(ov.hEvent);
+        }
+
+        if (connected && !_stop.load())
         {
             handleClient(pipe);
         }
@@ -291,12 +377,42 @@ void ControlPlane::threadMain()
 
 void ControlPlane::handleClient(HANDLE pipe)
 {
+    // Issue #3: Use overlapped ReadFile with 10-second timeout to prevent DoS by non-sending clients.
     std::vector<char> buffer(kMaxReadSize);
     DWORD read = 0;
-    if (!ReadFile(pipe, buffer.data(), static_cast<DWORD>(buffer.size()), &read, nullptr))
+
+    OVERLAPPED ov{};
+    ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!ov.hEvent)
     {
         return;
     }
+
+    bool readOk = false;
+    if (ReadFile(pipe, buffer.data(), static_cast<DWORD>(buffer.size()), &read, &ov))
+    {
+        readOk = true;
+    }
+    else if (GetLastError() == ERROR_IO_PENDING)
+    {
+        const auto waitResult = WaitForSingleObject(ov.hEvent, 10000); // 10s timeout
+        if (waitResult == WAIT_OBJECT_0)
+        {
+            readOk = GetOverlappedResult(pipe, &ov, &read, FALSE) != 0;
+        }
+        else
+        {
+            CancelIoEx(pipe, &ov);
+            appendLogLine("client-read-timeout");
+        }
+    }
+    CloseHandle(ov.hEvent);
+
+    if (!readOk || read == 0)
+    {
+        return;
+    }
+
     const std::string request(buffer.data(), read);
     const auto trimmed = trimWhitespace(request);
     if (trimmed.empty())
@@ -323,7 +439,8 @@ std::string ControlPlane::buildResponse(const std::string& request)
             const auto arg = request.substr(6);
             if (!arg.empty())
             {
-                tabIdx = static_cast<size_t>(std::stoull(arg));
+                try { tabIdx = static_cast<size_t>(std::stoull(arg)); }
+                catch (...) { return "ERR|" + _sessionName + "|invalid-argument\n"; }
             }
         }
         return respondState(tabIdx);
@@ -336,7 +453,8 @@ std::string ControlPlane::buildResponse(const std::string& request)
             const auto arg = request.substr(5);
             if (!arg.empty())
             {
-                lines = static_cast<size_t>(std::stoull(arg));
+                try { lines = static_cast<size_t>(std::stoull(arg)); }
+                catch (...) { return "ERR|" + _sessionName + "|invalid-argument\n"; }
             }
         }
         return respondTail(lines);
@@ -386,7 +504,8 @@ std::string ControlPlane::buildResponse(const std::string& request)
             const auto arg = request.substr(10);
             if (!arg.empty())
             {
-                idx = static_cast<size_t>(std::stoull(arg));
+                try { idx = static_cast<size_t>(std::stoull(arg)); }
+                catch (...) { return "ERR|" + _sessionName + "|invalid-argument\n"; }
             }
         }
         return respondCloseTab(idx);
@@ -398,7 +517,10 @@ std::string ControlPlane::buildResponse(const std::string& request)
         {
             return "ERR|" + _sessionName + "|missing-tab-index\n";
         }
-        return respondSwitchTab(static_cast<size_t>(std::stoull(arg)));
+        size_t tabIdx;
+        try { tabIdx = static_cast<size_t>(std::stoull(arg)); }
+        catch (...) { return "ERR|" + _sessionName + "|invalid-argument\n"; }
+        return respondSwitchTab(tabIdx);
     }
     if (request == "FOCUS")
     {
@@ -774,36 +896,68 @@ void ControlPlane::setWindowFocus() const
 template<typename TResult>
 TResult ControlPlane::runOnUiThread(std::function<TResult()> action) const
 {
+    // Issue #1: Check _stop before dispatching to avoid deadlock during shutdown.
+    if (_stop.load())
+    {
+        return TResult{};
+    }
     std::promise<TResult> promise;
     auto future = promise.get_future();
-    _dispatcher.RunAsync(CoreDispatcherPriority::Normal, [action = std::move(action), promise = std::move(promise)]() mutable {
-        try
-        {
-            promise.set_value(action());
-        }
-        catch (...)
-        {
-            promise.set_exception(std::current_exception());
-        }
-    });
-    return future.get();
+    try
+    {
+        _dispatcher.RunAsync(CoreDispatcherPriority::Normal, [action = std::move(action), promise = std::move(promise)]() mutable {
+            try
+            {
+                promise.set_value(action());
+            }
+            catch (...)
+            {
+                promise.set_exception(std::current_exception());
+            }
+        });
+    }
+    catch (...)
+    {
+        // Dispatcher may be shut down already
+        return TResult{};
+    }
+    // Timed wait to avoid deadlock if UI thread is blocked
+    if (future.wait_for(std::chrono::seconds(5)) == std::future_status::ready)
+    {
+        return future.get();
+    }
+    return TResult{};
 }
 
 // Helper: run void action on UI thread (avoids template<void> specialization issues)
 void ControlPlane::runVoidOnUiThread(std::function<void()> action) const
 {
+    // Issue #1: Check _stop before dispatching to avoid deadlock during shutdown.
+    if (_stop.load())
+    {
+        return;
+    }
     std::promise<void> promise;
     auto future = promise.get_future();
-    _dispatcher.RunAsync(CoreDispatcherPriority::Normal, [action = std::move(action), promise = std::move(promise)]() mutable {
-        try
-        {
-            action();
-            promise.set_value();
-        }
-        catch (...)
-        {
-            promise.set_exception(std::current_exception());
-        }
-    });
-    future.get();
+    try
+    {
+        _dispatcher.RunAsync(CoreDispatcherPriority::Normal, [action = std::move(action), promise = std::move(promise)]() mutable {
+            try
+            {
+                action();
+                promise.set_value();
+            }
+            catch (...)
+            {
+                promise.set_exception(std::current_exception());
+            }
+        });
+    }
+    catch (...)
+    {
+        // Dispatcher may be shut down already
+        return;
+    }
+    // Timed wait to avoid deadlock if UI thread is blocked
+    future.wait_for(std::chrono::seconds(5));
 }

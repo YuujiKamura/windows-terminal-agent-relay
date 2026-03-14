@@ -98,7 +98,7 @@
 
   <ItemDefinitionGroup>
     <Link>
-      <AdditionalDependencies>User32.lib;WindowsApp.lib;shell32.lib;WinMM.Lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>User32.lib;WindowsApp.lib;shell32.lib;WinMM.Lib;Advapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <!-- TerminalAppLib contains a DllMain that we need to force the use of. -->
       <AdditionalOptions Condition="'$(Platform)'=='Win32'">/INCLUDE:_DllMain@12 %(AdditionalOptions)</AdditionalOptions>
       <AdditionalOptions Condition="'$(Platform)'!='Win32'">/INCLUDE:DllMain %(AdditionalOptions)</AdditionalOptions>
