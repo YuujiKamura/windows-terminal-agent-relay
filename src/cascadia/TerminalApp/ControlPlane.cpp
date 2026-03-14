@@ -104,21 +104,33 @@ namespace
 
 bool ControlPlane::IsEnabled()
 {
-    if (const auto flag = getEnvVar(kControlPlaneEnabledEnv.data()))
+    const auto flag1 = getEnvVar(kControlPlaneEnabledEnv.data());
+    const auto flag2 = getEnvVar(kWin32ControlPlaneEnabledEnv.data());
+
+    // Debug: write diagnostic
     {
-        if (isTruthy(*flag))
+        const auto localApp = getEnvVar("LOCALAPPDATA");
+        if (localApp)
         {
-            return true;
+            std::filesystem::path diagPath(*localApp);
+            diagPath /= L"WindowsTerminal";
+            std::filesystem::create_directories(diagPath);
+            diagPath /= L"control-plane-diag.log";
+            std::ofstream diag(diagPath, std::ios::app);
+            diag << "IsEnabled: flag1=" << flag1.value_or("(not set)")
+                 << " flag2=" << flag2.value_or("(not set)") << "\n";
+            diag.flush();
         }
     }
-    if (const auto flag = getEnvVar(kWin32ControlPlaneEnabledEnv.data()))
-    {
-        if (isTruthy(*flag))
-        {
-            return true;
-        }
-    }
+
+    if (flag1 && isTruthy(*flag1)) return true;
+    if (flag2 && isTruthy(*flag2)) return true;
+#ifdef WT_BRANDING_DEV
+    // Dev builds: enable control plane by default for testing
+    return true;
+#else
     return false;
+#endif
 }
 
 ControlPlane::ControlPlane(TerminalPage& page) :
@@ -126,6 +138,23 @@ ControlPlane::ControlPlane(TerminalPage& page) :
     _dispatcher(_page.Dispatcher()),
     _pid(static_cast<size_t>(GetCurrentProcessId()))
 {
+    // Debug: write diagnostic to a known location regardless of dispatcher state
+    {
+        const auto localApp = getEnvVar("LOCALAPPDATA");
+        if (localApp)
+        {
+            std::filesystem::path diagPath(*localApp);
+            diagPath /= L"WindowsTerminal";
+            std::filesystem::create_directories(diagPath);
+            diagPath /= L"control-plane-diag.log";
+            std::ofstream diag(diagPath, std::ios::app);
+            diag << "ControlPlane ctor: pid=" << _pid
+                 << " dispatcher=" << (_dispatcher ? "OK" : "NULL")
+                 << " env=" << getEnvVar(kControlPlaneEnabledEnv.data()).value_or("(not set)")
+                 << "\n";
+            diag.flush();
+        }
+    }
     if (!_dispatcher)
     {
         return;
