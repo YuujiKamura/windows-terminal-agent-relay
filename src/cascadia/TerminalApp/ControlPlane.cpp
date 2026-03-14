@@ -22,6 +22,14 @@ using namespace winrt::Windows::Foundation;
 
 namespace
 {
+    constexpr std::string_view kControlPlaneEnabledEnv{ "WINDOWS_TERMINAL_CONTROL_PLANE" };
+    constexpr std::string_view kWin32ControlPlaneEnabledEnv{ "WINDOWS_TERMINAL_WIN32_CONTROL_PLANE" };
+    constexpr std::string_view kSessionNameEnv{ "WINDOWS_TERMINAL_SESSION_NAME" };
+    constexpr std::string_view kPipePrefix{ "windows-terminal-winui3-" };
+    constexpr std::wstring_view kLocalAppDataRootDir{ L"WindowsTerminal" };
+    constexpr std::wstring_view kControlPlaneDir{ L"control-plane" };
+    constexpr std::wstring_view kRuntimeDir{ L"winui3" };
+
     constexpr std::array<char, 64> kBase64Alphabet{
         'A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P',
         'Q','R','S','T','U','V','W','X','Y','Z','a','b','c','d','e','f',
@@ -95,14 +103,14 @@ namespace
 
 bool ControlPlane::IsEnabled()
 {
-    if (const auto flag = getEnvVar("GHOSTTY_CONTROL_PLANE"))
+    if (const auto flag = getEnvVar(kControlPlaneEnabledEnv.data()))
     {
         if (isTruthy(*flag))
         {
             return true;
         }
     }
-    if (const auto flag = getEnvVar("GHOSTTY_WIN32_CONTROL_PLANE"))
+    if (const auto flag = getEnvVar(kWin32ControlPlaneEnabledEnv.data()))
     {
         if (isTruthy(*flag))
         {
@@ -122,13 +130,13 @@ ControlPlane::ControlPlane(TerminalPage& page) :
         return;
     }
 
-    _sessionName = getEnvVar("GHOSTTY_SESSION_NAME").value_or("");
+    _sessionName = getEnvVar(kSessionNameEnv.data()).value_or("");
     if (_sessionName.empty())
     {
         _sessionName = "winui3-" + std::to_string(_pid);
     }
     _safeSessionName = sanitizeSessionName(_sessionName);
-    _pipeName = "ghostty-winui3-" + _safeSessionName + "-" + std::to_string(_pid);
+    _pipeName = std::string{ kPipePrefix } + _safeSessionName + "-" + std::to_string(_pid);
     _pipePath = "\\\\.\\pipe\\" + _pipeName;
     _hwnd = _page.HostingWindow().value_or(nullptr);
 
@@ -199,9 +207,9 @@ void ControlPlane::ensureDirectories()
         throw std::runtime_error("LOCALAPPDATA is missing");
     }
     std::filesystem::path root(fromUtf8(*localApp));
-    root /= L"ghostty";
-    root /= L"control-plane";
-    root /= L"winui3";
+    root /= kLocalAppDataRootDir;
+    root /= kControlPlaneDir;
+    root /= kRuntimeDir;
     _rootDir = root;
     _sessionsDir = _rootDir / L"sessions";
     _logsDir = _rootDir / L"logs";
