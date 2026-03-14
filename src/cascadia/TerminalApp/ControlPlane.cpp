@@ -649,13 +649,22 @@ void ControlPlane::drainPendingInputs()
                 entry.payload.size()));
             if (entry.raw)
             {
-                // RAW_INPUT: write directly to connection (bypass paste encoder)
+                // RAW_INPUT: write directly to connection (no paste wrapping)
                 control.SendInput(winrt::hstring(text));
             }
             else
             {
-                // INPUT: send as paste-style input
-                control.SendInput(winrt::hstring(text));
+                // INPUT: wrap with bracketed paste sequences if terminal supports it
+                if (control.BracketedPasteEnabled())
+                {
+                    control.SendInput(winrt::hstring(L"\x1b[200~"));
+                    control.SendInput(winrt::hstring(text));
+                    control.SendInput(winrt::hstring(L"\x1b[201~"));
+                }
+                else
+                {
+                    control.SendInput(winrt::hstring(text));
+                }
             }
         }
     });
@@ -674,8 +683,8 @@ ControlPlane::StateSnapshot ControlPlane::captureState(std::optional<size_t> tab
             const auto control = tab.value()->GetActiveTerminalControl();
             snapshot.hasSelection = control.HasSelection();
             snapshot.pwd = toUtf8(control.WorkingDirectory());
-            // ViewportText is impl-only; use title for prompt heuristic
-            snapshot.atPrompt = inferPromptFromViewport("", snapshot.pwd, toUtf8(tab.value()->Title()));
+            const auto buffer = toUtf8(control.ReadEntireBuffer());
+            snapshot.atPrompt = inferPromptFromViewport(buffer, snapshot.pwd, toUtf8(tab.value()->Title()));
         }
         return snapshot;
     });
@@ -710,7 +719,8 @@ std::string ControlPlane::captureTabList() const
                 const auto control = tabImpl->GetActiveTerminalControl();
                 const auto title = escapeField(toUtf8(tabImpl->Title()));
                 const auto pwd = toUtf8(control.WorkingDirectory());
-                const auto prompt = inferPromptFromViewport("", pwd, title);
+                const auto buffer = toUtf8(control.ReadEntireBuffer());
+                const auto prompt = inferPromptFromViewport(buffer, pwd, title);
                 oss << "TAB|" << i << "|" << title << "|pwd=" << pwd;
                 oss << "|prompt=" << (prompt ? '1' : '0') << "|selection=" << (control.HasSelection() ? '1' : '0') << "\n";
             }
