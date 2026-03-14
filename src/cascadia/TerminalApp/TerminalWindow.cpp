@@ -13,6 +13,7 @@
 #include "WindowProperties.g.cpp"
 
 #include "../TerminalSettingsAppAdapterLib/TerminalSettings.h"
+#include "ControlPlane.h"
 
 using namespace winrt::Windows::ApplicationModel;
 using namespace winrt::Windows::ApplicationModel::DataTransfer;
@@ -122,6 +123,8 @@ static Documents::Run _BuildErrorRun(const winrt::hstring& text, const ResourceD
 
 namespace winrt::TerminalApp::implementation
 {
+    TerminalWindow::~TerminalWindow() = default;
+
     TerminalWindow::TerminalWindow(const TerminalApp::SettingsLoadEventArgs& settingsLoadedResult,
                                    const TerminalApp::ContentManager& manager) :
         _settings{ settingsLoadedResult.NewSettings() },
@@ -216,6 +219,11 @@ namespace winrt::TerminalApp::implementation
                                                            SystemMenuChangeAction::Add,
                                                            SystemMenuItemHandler(this, &TerminalWindow::_OpenSettingsUI));
         SystemMenuChangeRequested.raise(*this, *args);
+
+        if (ControlPlane::IsEnabled())
+        {
+            _controlPlane = std::make_unique<ControlPlane>(*_root);
+        }
 
         TraceLoggingWrite(
             g_hTerminalAppProvider,

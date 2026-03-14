@@ -2629,6 +2629,11 @@ namespace winrt::TerminalApp::implementation
         return _tabs.Size();
     }
 
+    std::optional<HWND> TerminalPage::HostingWindow() const noexcept
+    {
+        return _hostingHwnd;
+    }
+
     // Method Description:
     // - Called when it is determined that an existing tab or pane should be
     //   attached to our window. content represents a blob of JSON describing

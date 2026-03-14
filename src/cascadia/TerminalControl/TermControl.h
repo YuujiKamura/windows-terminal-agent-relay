@@ -76,6 +76,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
         Windows::Foundation::Size MinimumSize();
         float SnapDimensionToGrid(const bool widthOrHeight, const float dimension);
         void PreviewInput(const winrt::hstring& text);
+        std::wstring ViewportText() const;
 
         Windows::Foundation::Point CursorPositionInDips();
         double QuickFixButtonWidth();

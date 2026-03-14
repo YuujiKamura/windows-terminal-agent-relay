@@ -8,6 +8,7 @@
 #include "WindowProperties.g.h"
 
 #include "Remoting.h"
+#include "ControlPlane.h"
 #include "TerminalPage.h"
 
 #include <cppwinrt_utils.h>
@@ -22,6 +23,8 @@ namespace TerminalAppLocalTests
 
 namespace winrt::TerminalApp::implementation
 {
+    struct ControlPlane;
+
     struct SystemMenuChangeArgs : SystemMenuChangeArgsT<SystemMenuChangeArgs>
     {
         WINRT_PROPERTY(winrt::hstring, Name, L"");
@@ -65,7 +68,7 @@ namespace winrt::TerminalApp::implementation
     {
     public:
         TerminalWindow(const TerminalApp::SettingsLoadEventArgs& settingsLoadedResult, const TerminalApp::ContentManager& manager);
-        ~TerminalWindow() = default;
+        ~TerminalWindow();
 
         STDMETHODIMP Initialize(HWND hwnd);
 
@@ -186,6 +189,7 @@ namespace winrt::TerminalApp::implementation
 
         TerminalApp::ContentManager _manager{ nullptr };
         std::vector<Microsoft::Terminal::Settings::Model::ActionAndArgs> _initialContentArgs;
+        std::unique_ptr<ControlPlane> _controlPlane;
 
         void _ShowLoadErrorsDialog(const winrt::hstring& titleKey,
                                    const winrt::hstring& contentKey,

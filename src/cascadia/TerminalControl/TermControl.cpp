@@ -6,6 +6,8 @@
 
 #include <inputpaneinterop.h>
 
+#include "../../buffer/out/TextBuffer.hpp"
+
 #include "TermControlAutomationPeer.h"
 #include "../../renderer/atlas/AtlasEngine.h"
 #include "../../tsf/Handle.h"
@@ -2519,6 +2521,25 @@ namespace winrt::Microsoft::Terminal::Control::implementation
     hstring TermControl::GetStartingTitle() const
     {
         return _core.Settings().StartingTitle();
+    }
+
+    std::wstring TermControl::ViewportText() const
+    {
+        const auto core = get_self<ControlCore>(_core);
+        if (!core)
+        {
+            return {};
+        }
+
+        auto* rd = core->GetRenderData();
+        rd->LockConsole();
+        const auto unlock = wil::scope_exit([&]() {
+            rd->UnlockConsole();
+        });
+
+        const auto viewport = rd->GetViewport();
+        const auto& buffer = rd->GetTextBuffer();
+        return buffer.GetPlainText(viewport.Origin(), viewport.BottomRightExclusive());
     }
 
     hstring TermControl::WorkingDirectory() const
