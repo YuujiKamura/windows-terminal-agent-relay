@@ -134,11 +134,36 @@ ControlPlane::ControlPlane(TerminalPage& page) :
 
     try
     {
+        TraceLoggingWrite(g_hTerminalAppProvider, "ControlPlaneInitStep", TraceLoggingString("ensureDirectories:start", "Step"));
         ensureDirectories();
+        TraceLoggingWrite(g_hTerminalAppProvider, "ControlPlaneInitStep", TraceLoggingString("ensureDirectories:done", "Step"));
+        TraceLoggingWrite(g_hTerminalAppProvider, "ControlPlaneInitStep", TraceLoggingString("writeSessionFile:start", "Step"));
         writeSessionFile();
-        appendLogLine("control-plane-started");
+        TraceLoggingWrite(g_hTerminalAppProvider, "ControlPlaneInitStep", TraceLoggingString("writeSessionFile:done", "Step"));
         _logFile.open(_logFilePath, std::ios::app);
-        _serverThread = std::thread([this]() { threadMain(); });
+        appendLogLine("control-plane-log-opened");
+        appendLogLine("control-plane-thread-create:start");
+        _serverThread = std::thread([this]() {
+            try
+            {
+                appendLogLine("control-plane-thread:entered");
+                threadMain();
+                appendLogLine("control-plane-thread:exited");
+            }
+            catch (const std::exception& e)
+            {
+                appendLogLine(std::string("control-plane-thread:exception:") + e.what());
+                TraceLoggingWrite(g_hTerminalAppProvider,
+                                  "ControlPlaneThreadException",
+                                  TraceLoggingString(e.what(), "Reason"));
+            }
+            catch (...)
+            {
+                appendLogLine("control-plane-thread:unknown-exception");
+                TraceLoggingWrite(g_hTerminalAppProvider, "ControlPlaneThreadUnknownException");
+            }
+        });
+        appendLogLine("control-plane-thread-create:done");
     }
     catch (const std::exception& e)
     {
