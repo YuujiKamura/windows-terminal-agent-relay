@@ -566,6 +566,22 @@ std::string ControlPlane::buildResponse(const std::string& request)
     {
         return respondAgentStatus();
     }
+    if (request.rfind("SET_AGENT|", 0) == 0)
+    {
+        // SET_AGENT|<tab_index>|<agent_type>
+        const auto payload = request.substr(10);
+        const auto sep = payload.find('|');
+        if (sep == std::string::npos)
+        {
+            return "ERR|" + _sessionName + "|invalid-argument\n";
+        }
+        size_t tabIdx;
+        try { tabIdx = static_cast<size_t>(std::stoull(payload.substr(0, sep))); }
+        catch (...) { return "ERR|" + _sessionName + "|invalid-argument\n"; }
+        const auto agentType = payload.substr(sep + 1);
+        _tabAgentTypes[tabIdx] = agentType;
+        return "ACK|" + _sessionName + "|SET_AGENT|" + std::to_string(tabIdx) + "|" + agentType + "\n";
+    }
     return "ERR|" + _sessionName + "|unknown\n";
 }
 
@@ -661,31 +677,68 @@ std::string ControlPlane::respondAgentStatus()
     auto& lastSnapshot = _tabBufferSnapshots[tabIdx];
     auto& lastChangeTime = _tabBufferChangeTimes[tabIdx];
 
-    // Initialize change time on first call for this tab
+    // Initialize on first call for this tab
     if (lastSnapshot.empty() && lastChangeTime == std::chrono::steady_clock::time_point{})
     {
         lastSnapshot = currentBuffer;
         lastChangeTime = now;
     }
 
-    std::string status;
-    if (currentBuffer != lastSnapshot)
+    // Detect buffer change
+    const bool bufferChanged = (currentBuffer != lastSnapshot);
+    if (bufferChanged)
     {
         lastSnapshot = currentBuffer;
         lastChangeTime = now;
+    }
+
+    // Determine ready markers per agent type
+    const auto agentIt = _tabAgentTypes.find(tabIdx);
+    const bool hasAgent = (agentIt != _tabAgentTypes.end());
+    bool agentReady = false;
+
+    if (hasAgent)
+    {
+        const auto& agentType = agentIt->second;
+        if (agentType == "gemini")
+        {
+            agentReady = currentBuffer.find("Type your message") != std::string::npos;
+        }
+        else if (agentType == "codex")
+        {
+            // Codex shows ">" at prompt and banner with version
+            agentReady = currentBuffer.find("OpenAI Codex") != std::string::npos;
+        }
+        else if (agentType == "claude")
+        {
+            // Claude Code shows "$" or ">" after initialization
+            agentReady = currentBuffer.find("$ ") != std::string::npos ||
+                         currentBuffer.find("> ") != std::string::npos;
+        }
+    }
+
+    // Determine status
+    std::string status;
+    if (currentBuffer.find("Allow once") != std::string::npos ||
+        currentBuffer.find("Action Required") != std::string::npos)
+    {
+        status = "APPROVAL";
+    }
+    else if (bufferChanged)
+    {
         status = "WORKING";
+    }
+    else if (hasAgent && !agentReady)
+    {
+        status = "STARTING";
+    }
+    else if (hasAgent && agentReady)
+    {
+        status = "READY";
     }
     else
     {
-        if (currentBuffer.find("Allow once") != std::string::npos ||
-            currentBuffer.find("Action Required") != std::string::npos)
-        {
-            status = "APPROVAL";
-        }
-        else
-        {
-            status = "IDLE";
-        }
+        status = "IDLE";
     }
 
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastChangeTime).count();

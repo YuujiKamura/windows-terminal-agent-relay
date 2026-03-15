@@ -124,6 +124,7 @@ namespace winrt::TerminalApp::implementation
 
         std::unordered_map<size_t, std::string> _tabBufferSnapshots;
         std::unordered_map<size_t, std::chrono::steady_clock::time_point> _tabBufferChangeTimes;
+        std::unordered_map<size_t, std::string> _tabAgentTypes; // "gemini", "codex", "claude"
 
         static constexpr size_t kMaxReadSize = 64 * 1024;
     };
