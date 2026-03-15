@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -58,6 +59,7 @@ namespace winrt::TerminalApp::implementation
         std::string respondCloseTab(std::optional<size_t> index);
         std::string respondSwitchTab(size_t index);
         std::string respondFocus();
+        std::string respondAgentStatus();
 
         bool enqueueInput(std::string from, std::vector<uint8_t>&& payload, bool raw);
         void drainPendingInputs();
@@ -118,6 +120,9 @@ namespace winrt::TerminalApp::implementation
         std::string _safeSessionName;
         std::string _pipeName;
         std::string _pipePath;
+
+        std::string _lastBufferSnapshot;
+        std::chrono::steady_clock::time_point _lastBufferChangeTime;
 
         static constexpr size_t kMaxReadSize = 64 * 1024;
     };

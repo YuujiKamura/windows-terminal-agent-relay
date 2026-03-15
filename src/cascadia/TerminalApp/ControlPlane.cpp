@@ -11,6 +11,7 @@
 #include <iomanip>
 #include <sddl.h>
 #include <sstream>
+#include <thread>
 
 // Use projected types only - do NOT include TermControl impl header
 // (it causes WinRT vtable errors when included from TerminalApp project)
@@ -515,13 +516,17 @@ std::string ControlPlane::buildResponse(const std::string& request)
             return "ERR|" + _sessionName + "|invalid-base64\n";
         }
         const auto decodedSize = decoded.size();
+        const auto beforeSnapshot = captureTailContent(5);
         if (!enqueueInput(std::string(from), std::move(decoded), raw))
         {
             return "ERR|" + _sessionName + "|enqueue-failed\n";
         }
         drainPendingInputs();
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        const auto afterSnapshot = captureTailContent(5);
+        const bool bufferChanged = (beforeSnapshot != afterSnapshot);
         appendLogLine(std::string(raw ? "RAW_INPUT" : "INPUT") + "|" + std::string(from) + "|" + std::to_string(decodedSize));
-        return "ACK|" + _sessionName + "|" + std::to_string(_pid) + "\n";
+        return "ACK|" + _sessionName + "|" + std::to_string(_pid) + "|buffer_changed=" + (bufferChanged ? "true" : "false") + "\n";
     }
     if (request == "NEW_TAB")
     {
@@ -556,6 +561,10 @@ std::string ControlPlane::buildResponse(const std::string& request)
     if (request == "FOCUS")
     {
         return respondFocus();
+    }
+    if (request == "AGENT_STATUS")
+    {
+        return respondAgentStatus();
     }
     return "ERR|" + _sessionName + "|unknown\n";
 }
@@ -638,6 +647,37 @@ std::string ControlPlane::respondFocus()
     setWindowFocus();
     appendLogLine("FOCUS");
     return "ACK|" + _sessionName + "|FOCUS\n";
+}
+
+std::string ControlPlane::respondAgentStatus()
+{
+    const auto currentBuffer = captureTailContent(10);
+    const auto now = std::chrono::steady_clock::now();
+
+    std::string status;
+    if (currentBuffer != _lastBufferSnapshot)
+    {
+        _lastBufferSnapshot = currentBuffer;
+        _lastBufferChangeTime = now;
+        status = "WORKING";
+    }
+    else
+    {
+        if (currentBuffer.find("Allow once") != std::string::npos)
+        {
+            status = "APPROVAL";
+        }
+        else
+        {
+            status = "IDLE";
+        }
+    }
+
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - _lastBufferChangeTime).count();
+
+    std::ostringstream oss;
+    oss << "AGENT_STATUS|" << _sessionName << "|" << status << "|" << ms << "\n";
+    return oss.str();
 }
 
 bool ControlPlane::enqueueInput(std::string from, std::vector<uint8_t>&& payload, bool raw)
