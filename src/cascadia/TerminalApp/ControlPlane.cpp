@@ -651,19 +651,34 @@ std::string ControlPlane::respondFocus()
 
 std::string ControlPlane::respondAgentStatus()
 {
+    // Get active tab index
+    const auto snapshot = captureState(std::nullopt);
+    const auto tabIdx = snapshot.activeTab;
+
     const auto currentBuffer = captureTailContent(10);
     const auto now = std::chrono::steady_clock::now();
 
-    std::string status;
-    if (currentBuffer != _lastBufferSnapshot)
+    auto& lastSnapshot = _tabBufferSnapshots[tabIdx];
+    auto& lastChangeTime = _tabBufferChangeTimes[tabIdx];
+
+    // Initialize change time on first call for this tab
+    if (lastSnapshot.empty() && lastChangeTime == std::chrono::steady_clock::time_point{})
     {
-        _lastBufferSnapshot = currentBuffer;
-        _lastBufferChangeTime = now;
+        lastSnapshot = currentBuffer;
+        lastChangeTime = now;
+    }
+
+    std::string status;
+    if (currentBuffer != lastSnapshot)
+    {
+        lastSnapshot = currentBuffer;
+        lastChangeTime = now;
         status = "WORKING";
     }
     else
     {
-        if (currentBuffer.find("Allow once") != std::string::npos)
+        if (currentBuffer.find("Allow once") != std::string::npos ||
+            currentBuffer.find("Action Required") != std::string::npos)
         {
             status = "APPROVAL";
         }
@@ -673,10 +688,10 @@ std::string ControlPlane::respondAgentStatus()
         }
     }
 
-    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - _lastBufferChangeTime).count();
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastChangeTime).count();
 
     std::ostringstream oss;
-    oss << "AGENT_STATUS|" << _sessionName << "|" << status << "|" << ms << "\n";
+    oss << "AGENT_STATUS|" << _sessionName << "|" << status << "|" << ms << "|tab=" << tabIdx << "\n";
     return oss.str();
 }
 

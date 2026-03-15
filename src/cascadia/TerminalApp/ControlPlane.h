@@ -9,6 +9,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "TerminalPage.h"
@@ -121,8 +122,8 @@ namespace winrt::TerminalApp::implementation
         std::string _pipeName;
         std::string _pipePath;
 
-        std::string _lastBufferSnapshot;
-        std::chrono::steady_clock::time_point _lastBufferChangeTime;
+        std::unordered_map<size_t, std::string> _tabBufferSnapshots;
+        std::unordered_map<size_t, std::chrono::steady_clock::time_point> _tabBufferChangeTimes;
 
         static constexpr size_t kMaxReadSize = 64 * 1024;
     };
