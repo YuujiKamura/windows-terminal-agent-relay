@@ -9,7 +9,6 @@
 #include <filesystem>
 #include <future>
 #include <iomanip>
-#include <sddl.h>
 #include <sstream>
 #include <thread>
 
@@ -28,29 +27,6 @@ namespace
     constexpr std::string_view kWin32ControlPlaneEnabledEnv{ "WINDOWS_TERMINAL_WIN32_CONTROL_PLANE" };
     constexpr std::string_view kSessionNameEnv{ "WINDOWS_TERMINAL_SESSION_NAME" };
     constexpr std::string_view kPipePrefix{ "windows-terminal-winui3-" };
-    constexpr std::wstring_view kLocalAppDataRootDir{ L"WindowsTerminal" };
-    constexpr std::wstring_view kControlPlaneDir{ L"control-plane" };
-    constexpr std::wstring_view kRuntimeDir{ L"winui3" };
-
-    constexpr std::array<char, 64> kBase64Alphabet{
-        'A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P',
-        'Q','R','S','T','U','V','W','X','Y','Z','a','b','c','d','e','f',
-        'g','h','i','j','k','l','m','n','o','p','q','r','s','t','u','v',
-        'w','x','y','z','0','1','2','3','4','5','6','7','8','9','+','/'};
-
-    constexpr std::array<int, 256> makeBase64Map()
-    {
-        std::array<int, 256> map;
-        map.fill(-1);
-        for (size_t i = 0; i < kBase64Alphabet.size(); ++i)
-        {
-            map[static_cast<unsigned char>(kBase64Alphabet[i])] = static_cast<int>(i);
-        }
-        map[static_cast<unsigned char>('=')] = -2;
-        return map;
-    }
-
-    constexpr auto kBase64Map = makeBase64Map();
 
     bool isTruthy(std::string_view value)
     {
@@ -61,24 +37,6 @@ namespace
             lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
         }
         return lower == "1" || lower == "true" || lower == "yes";
-    }
-
-    std::string escapeField(std::string_view value)
-    {
-        std::string out;
-        out.reserve(value.size());
-        for (auto ch : value)
-        {
-            if (ch == '|' || ch == '\r' || ch == '\n')
-            {
-                out.push_back(' ');
-            }
-            else
-            {
-                out.push_back(ch);
-            }
-        }
-        return out;
     }
 
     std::string toHex(uintptr_t value)
@@ -101,7 +59,104 @@ namespace
         free(value);
         return result;
     }
+
+    // ──── DLL function pointer types ────
+    using CpServerCreateFn  = void* (*)(const char* session_name, const char* pipe_prefix, const void* vtable);
+    using CpServerStartFn   = int   (*)(void* server);
+    using CpServerStopFn    = void  (*)(void* server);
+    using CpServerDestroyFn = void  (*)(void* server);
 }
+
+// ──── VTable callback trampolines (extern "C" calling convention) ────
+// These are free functions with C linkage that forward to the ControlPlane
+// instance passed via the ctx pointer.
+
+extern "C" {
+
+static size_t cpVt_readBuffer(void* ctx, char* buf, size_t buf_len)
+{
+    auto* cp = static_cast<ControlPlane*>(ctx);
+    auto content = cp->captureTailContent(0);
+    const auto copyLen = std::min(content.size(), buf_len);
+    std::memcpy(buf, content.data(), copyLen);
+    return copyLen;
+}
+
+static void cpVt_sendInput(void* ctx, const uint8_t* text, size_t len, bool raw)
+{
+    auto* cp = static_cast<ControlPlane*>(ctx);
+    std::vector<uint8_t> payload(text, text + len);
+    cp->enqueueInput("dll", std::move(payload), raw);
+    cp->drainPendingInputs();
+}
+
+static size_t cpVt_tabCount(void* ctx)
+{
+    auto* cp = static_cast<ControlPlane*>(ctx);
+    return cp->captureTabCount();
+}
+
+static size_t cpVt_activeTab(void* ctx)
+{
+    auto* cp = static_cast<ControlPlane*>(ctx);
+    return cp->captureActiveTab();
+}
+
+static void cpVt_switchTab(void* ctx, size_t index)
+{
+    auto* cp = static_cast<ControlPlane*>(ctx);
+    cp->doSwitchTab(index);
+}
+
+static void cpVt_newTab(void* ctx)
+{
+    auto* cp = static_cast<ControlPlane*>(ctx);
+    cp->doNewTab();
+}
+
+static void cpVt_closeTab(void* ctx, size_t index)
+{
+    auto* cp = static_cast<ControlPlane*>(ctx);
+    cp->doCloseTab(index);
+}
+
+static void cpVt_focus(void* ctx)
+{
+    auto* cp = static_cast<ControlPlane*>(ctx);
+    cp->doFocus();
+}
+
+static size_t cpVt_hwnd(void* ctx)
+{
+    auto* cp = static_cast<ControlPlane*>(ctx);
+    return reinterpret_cast<size_t>(cp->getHwnd());
+}
+
+static size_t cpVt_tabTitle(void* ctx, size_t index, char* buf, size_t buf_len)
+{
+    auto* cp = static_cast<ControlPlane*>(ctx);
+    auto title = cp->captureTabTitle(index);
+    const auto copyLen = std::min(title.size(), buf_len);
+    std::memcpy(buf, title.data(), copyLen);
+    return copyLen;
+}
+
+static size_t cpVt_tabWorkingDir(void* ctx, size_t index, char* buf, size_t buf_len)
+{
+    auto* cp = static_cast<ControlPlane*>(ctx);
+    auto dir = cp->captureTabWorkingDir(index);
+    const auto copyLen = std::min(dir.size(), buf_len);
+    std::memcpy(buf, dir.data(), copyLen);
+    return copyLen;
+}
+
+static bool cpVt_tabHasSelection(void* ctx, size_t index)
+{
+    auto* cp = static_cast<ControlPlane*>(ctx);
+    return cp->captureTabHasSelection(index);
+}
+
+} // extern "C"
 
 bool ControlPlane::IsEnabled()
 {
@@ -173,579 +228,150 @@ ControlPlane::ControlPlane(TerminalPage& page) :
 
     try
     {
-        TraceLoggingWrite(g_hTerminalAppProvider, "ControlPlaneInitStep", TraceLoggingString("ensureDirectories:start", "Step"));
-        ensureDirectories();
-        TraceLoggingWrite(g_hTerminalAppProvider, "ControlPlaneInitStep", TraceLoggingString("ensureDirectories:done", "Step"));
-        TraceLoggingWrite(g_hTerminalAppProvider, "ControlPlaneInitStep", TraceLoggingString("writeSessionFile:start", "Step"));
-        writeSessionFile();
-        TraceLoggingWrite(g_hTerminalAppProvider, "ControlPlaneInitStep", TraceLoggingString("writeSessionFile:done", "Step"));
-        _logFile.open(_logFilePath, std::ios::app);
-        appendLogLine("control-plane-log-opened");
-        appendLogLine("control-plane-thread-create:start");
-        _serverThread = std::thread([this]() {
-            try
-            {
-                appendLogLine("control-plane-thread:entered");
-                threadMain();
-                appendLogLine("control-plane-thread:exited");
-            }
-            catch (const std::exception& e)
-            {
-                appendLogLine(std::string("control-plane-thread:exception:") + e.what());
-                TraceLoggingWrite(g_hTerminalAppProvider,
-                                  "ControlPlaneThreadException",
-                                  TraceLoggingString(e.what(), "Reason"));
-            }
-            catch (...)
-            {
-                appendLogLine("control-plane-thread:unknown-exception");
-                TraceLoggingWrite(g_hTerminalAppProvider, "ControlPlaneThreadUnknownException");
-            }
-        });
-        appendLogLine("control-plane-thread-create:done");
+        TraceLoggingWrite(g_hTerminalAppProvider, "ControlPlaneInitStep", TraceLoggingString("dll-load:start", "Step"));
+        initDll();
+        TraceLoggingWrite(g_hTerminalAppProvider, "ControlPlaneInitStep", TraceLoggingString("dll-load:done", "Step"));
     }
     catch (const std::exception& e)
     {
         TraceLoggingWrite(g_hTerminalAppProvider,
                           "ControlPlaneInitFailed",
                           TraceLoggingString(e.what(), "Reason"));
+        appendDiagLog(std::string("ControlPlane init failed: ") + e.what());
     }
 }
 
 ControlPlane::~ControlPlane()
 {
     _stop.store(true);
-    // T3 fix: Cancel any queued UI-thread lambdas before destroying members.
     _cancelled->store(true);
+
+    if (_dllServer)
     {
-        std::lock_guard<std::mutex> guard(_pipeMutex);
-        if (_currentPipe != INVALID_HANDLE_VALUE)
-        {
-            CancelIoEx(_currentPipe, nullptr);
-            FlushFileBuffers(_currentPipe);
-        }
+        if (_fnStop) _fnStop(_dllServer);
+        if (_fnDestroy) _fnDestroy(_dllServer);
+        _dllServer = nullptr;
     }
-    if (_serverThread.joinable())
+    if (_dllHandle)
     {
-        // Issue #1: Avoid deadlock when destructor runs on UI thread.
-        // The server thread may be blocked on future.get() waiting for UI dispatch.
-        // Use a timed join: if the thread doesn't finish within 2 seconds, detach it.
-        auto handle = _serverThread.native_handle();
-        auto waitResult = WaitForSingleObject(handle, 2000);
-        if (waitResult == WAIT_OBJECT_0)
-        {
-            _serverThread.join();
-        }
-        else
-        {
-            _serverThread.detach();
-            appendLogLine("control-plane-thread:detached-on-shutdown-timeout");
-        }
+        FreeLibrary(_dllHandle);
+        _dllHandle = nullptr;
     }
-    if (_logFile.is_open())
-    {
-        appendLogLine("control-plane-log-closed");
-        _logFile.close();
-    }
-    removeSessionFile();
 }
 
-void ControlPlane::ensureDirectories()
+void ControlPlane::initDll()
+{
+    // Try to load control_plane_server.dll from same directory as exe
+    _dllHandle = LoadLibraryW(L"control_plane_server.dll");
+    if (!_dllHandle)
+    {
+        const auto err = GetLastError();
+        appendDiagLog("LoadLibrary(control_plane_server.dll) failed, error=" + std::to_string(err) + " — control plane disabled");
+        TraceLoggingWrite(g_hTerminalAppProvider, "ControlPlaneDllNotFound",
+                          TraceLoggingUInt32(static_cast<DWORD>(err), "Error"));
+        return; // Graceful fallback: control plane simply disabled
+    }
+
+    auto fnCreate  = reinterpret_cast<CpServerCreateFn>(GetProcAddress(_dllHandle, "cp_server_create_with_prefix"));
+    auto fnStart   = reinterpret_cast<CpServerStartFn>(GetProcAddress(_dllHandle, "cp_server_start"));
+    _fnStop    = reinterpret_cast<CpServerStopFn>(GetProcAddress(_dllHandle, "cp_server_stop"));
+    _fnDestroy = reinterpret_cast<CpServerDestroyFn>(GetProcAddress(_dllHandle, "cp_server_destroy"));
+
+    if (!fnCreate || !fnStart || !_fnStop || !_fnDestroy)
+    {
+        appendDiagLog("GetProcAddress failed for one or more DLL exports — control plane disabled");
+        FreeLibrary(_dllHandle);
+        _dllHandle = nullptr;
+        return;
+    }
+
+    // Build the VTable — C ABI struct matching TerminalProviderVTable in ffi.rs
+    // Layout must match the Rust repr(C) struct exactly:
+    //   read_buffer, send_input, tab_count, active_tab, switch_tab,
+    //   new_tab, close_tab, focus, hwnd, tab_title, tab_working_dir,
+    //   tab_has_selection, ctx
+    struct TerminalProviderVTable
+    {
+        decltype(&cpVt_readBuffer)      read_buffer;
+        decltype(&cpVt_sendInput)       send_input;
+        decltype(&cpVt_tabCount)        tab_count;
+        decltype(&cpVt_activeTab)       active_tab;
+        decltype(&cpVt_switchTab)       switch_tab;
+        decltype(&cpVt_newTab)          new_tab;
+        decltype(&cpVt_closeTab)        close_tab;
+        decltype(&cpVt_focus)           focus;
+        decltype(&cpVt_hwnd)            hwnd;
+        decltype(&cpVt_tabTitle)        tab_title;
+        decltype(&cpVt_tabWorkingDir)   tab_working_dir;
+        decltype(&cpVt_tabHasSelection) tab_has_selection;
+        void*                           ctx;
+    };
+
+    TerminalProviderVTable vtable{};
+    vtable.read_buffer      = cpVt_readBuffer;
+    vtable.send_input       = cpVt_sendInput;
+    vtable.tab_count        = cpVt_tabCount;
+    vtable.active_tab       = cpVt_activeTab;
+    vtable.switch_tab       = cpVt_switchTab;
+    vtable.new_tab          = cpVt_newTab;
+    vtable.close_tab        = cpVt_closeTab;
+    vtable.focus            = cpVt_focus;
+    vtable.hwnd             = cpVt_hwnd;
+    vtable.tab_title        = cpVt_tabTitle;
+    vtable.tab_working_dir  = cpVt_tabWorkingDir;
+    vtable.tab_has_selection = cpVt_tabHasSelection;
+    vtable.ctx              = static_cast<void*>(this);
+
+    _dllServer = fnCreate(_sessionName.c_str(), "windows-terminal-winui3", &vtable);
+    if (!_dllServer)
+    {
+        appendDiagLog("cp_server_create returned null — control plane disabled");
+        FreeLibrary(_dllHandle);
+        _dllHandle = nullptr;
+        return;
+    }
+
+    const auto startResult = fnStart(_dllServer);
+    if (startResult != 0)
+    {
+        appendDiagLog("cp_server_start failed with code=" + std::to_string(startResult));
+        _fnDestroy(_dllServer);
+        _dllServer = nullptr;
+        FreeLibrary(_dllHandle);
+        _dllHandle = nullptr;
+        return;
+    }
+
+    appendDiagLog("control-plane-dll: started successfully, pipe=" + _pipeName);
+}
+
+void ControlPlane::appendDiagLog(const std::string& message)
 {
     const auto localApp = getEnvVar("LOCALAPPDATA");
-    if (!localApp)
+    if (localApp)
     {
-        throw std::runtime_error("LOCALAPPDATA is missing");
-    }
-    std::filesystem::path root(fromUtf8(*localApp));
-    root /= kLocalAppDataRootDir;
-    root /= kControlPlaneDir;
-    root /= kRuntimeDir;
-    _rootDir = root;
-    _sessionsDir = _rootDir / L"sessions";
-    _logsDir = _rootDir / L"logs";
-    std::filesystem::create_directories(_sessionsDir);
-    std::filesystem::create_directories(_logsDir);
-}
-
-void ControlPlane::writeSessionFile()
-{
-    const auto baseName = _safeSessionName + "-" + std::to_string(_pid);
-    _sessionFile = _sessionsDir / (baseName + ".session");
-    _logFilePath = _logsDir / (baseName + ".log");
-
-    std::ofstream session(_sessionFile, std::ios::trunc);
-    session << "session_name=" << _sessionName << "\n";
-    session << "safe_session_name=" << _safeSessionName << "\n";
-    session << "pid=" << _pid << "\n";
-    session << "hwnd=" << toHex(reinterpret_cast<uintptr_t>(_hwnd)) << "\n";
-    session << "pipe_name=" << _pipeName << "\n";
-    session << "pipe_path=" << _pipePath << "\n";
-    session << "log_file=" << toUtf8(_logFilePath.wstring()) << "\n";
-}
-
-void ControlPlane::removeSessionFile() noexcept
-{
-    std::error_code ec;
-    std::filesystem::remove(_sessionFile, ec);
-}
-
-void ControlPlane::appendLogLine(std::string line)
-{
-    std::lock_guard<std::mutex> guard(_logMutex);
-    if (_logFile.is_open())
-    {
-        _logFile << line << "\n";
-        _logFile.flush();
+        std::filesystem::path diagPath(*localApp);
+        diagPath /= L"WindowsTerminal";
+        std::filesystem::create_directories(diagPath);
+        diagPath /= L"control-plane-diag.log";
+        std::ofstream diag(diagPath, std::ios::app);
+        diag << message << "\n";
+        diag.flush();
     }
 }
 
-HANDLE ControlPlane::createServerPipe() const
+// ──── Public methods called from VTable callbacks ────
+
+std::string ControlPlane::captureTailContent(size_t /*lines*/) const
 {
-    // Issue #2: Create a security descriptor that restricts pipe access to the current user.
-    SECURITY_ATTRIBUTES sa{};
-    sa.nLength = sizeof(sa);
-    sa.bInheritHandle = FALSE;
-
-    // DACL: allow GENERIC_ALL to the current user only (owner).
-    // "D:(A;;GA;;;OW)" = Allow Generic All to Owner.
-    PSECURITY_DESCRIPTOR pSD = nullptr;
-    if (!ConvertStringSecurityDescriptorToSecurityDescriptorA(
-            "D:(A;;GA;;;OW)", SDDL_REVISION_1, &pSD, nullptr))
-    {
-        // Fallback: create pipe without explicit security (same as before)
-        return CreateNamedPipeA(
-            _pipePath.c_str(),
-            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
-            PIPE_TYPE_BYTE | PIPE_WAIT,
-            1,
-            static_cast<DWORD>(kMaxReadSize),
-            static_cast<DWORD>(kMaxReadSize),
-            0,
-            nullptr);
-    }
-    sa.lpSecurityDescriptor = pSD;
-
-    auto pipe = CreateNamedPipeA(
-        _pipePath.c_str(),
-        PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
-        PIPE_TYPE_BYTE | PIPE_WAIT,
-        1,
-        static_cast<DWORD>(kMaxReadSize),
-        static_cast<DWORD>(kMaxReadSize),
-        0,
-        &sa);
-
-    LocalFree(pSD);
-    return pipe;
-}
-
-void ControlPlane::threadMain()
-{
-    while (!_stop.load())
-    {
-        const auto pipe = createServerPipe();
-        if (pipe == INVALID_HANDLE_VALUE)
+    return runOnUiThread<std::string>([this]() -> std::string {
+        const auto control = getActiveControl(std::nullopt);
+        if (!control)
         {
-            break;
+            return {};
         }
-        {
-            std::lock_guard<std::mutex> guard(_pipeMutex);
-            _currentPipe = pipe;
-        }
-
-        // Issue #3: Use overlapped ConnectNamedPipe with timeout to avoid indefinite blocking.
-        OVERLAPPED ov{};
-        ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        bool connected = false;
-        if (ov.hEvent)
-        {
-            if (ConnectNamedPipe(pipe, &ov))
-            {
-                connected = true;
-            }
-            else
-            {
-                const auto err = GetLastError();
-                if (err == ERROR_PIPE_CONNECTED)
-                {
-                    connected = true;
-                }
-                else if (err == ERROR_IO_PENDING)
-                {
-                    // Wait with 5-second timeout, check _stop periodically
-                    while (!_stop.load())
-                    {
-                        const auto waitResult = WaitForSingleObject(ov.hEvent, 1000);
-                        if (waitResult == WAIT_OBJECT_0)
-                        {
-                            DWORD dummy = 0;
-                            connected = GetOverlappedResult(pipe, &ov, &dummy, FALSE) != 0;
-                            break;
-                        }
-                        // WAIT_TIMEOUT: loop and re-check _stop
-                    }
-                    if (_stop.load() && !connected)
-                    {
-                        CancelIoEx(pipe, &ov);
-                    }
-                }
-            }
-            CloseHandle(ov.hEvent);
-        }
-
-        if (connected && !_stop.load())
-        {
-            handleClient(pipe);
-        }
-        DisconnectNamedPipe(pipe);
-        CloseHandle(pipe);
-        {
-            std::lock_guard<std::mutex> guard(_pipeMutex);
-            _currentPipe = INVALID_HANDLE_VALUE;
-        }
-    }
-}
-
-void ControlPlane::handleClient(HANDLE pipe)
-{
-    // Issue #3: Use overlapped ReadFile with 10-second timeout to prevent DoS by non-sending clients.
-    std::vector<char> buffer(kMaxReadSize);
-    DWORD read = 0;
-
-    OVERLAPPED ov{};
-    ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!ov.hEvent)
-    {
-        return;
-    }
-
-    bool readOk = false;
-    if (ReadFile(pipe, buffer.data(), static_cast<DWORD>(buffer.size()), &read, &ov))
-    {
-        readOk = true;
-    }
-    else if (GetLastError() == ERROR_IO_PENDING)
-    {
-        const auto waitResult = WaitForSingleObject(ov.hEvent, 10000); // 10s timeout
-        if (waitResult == WAIT_OBJECT_0)
-        {
-            readOk = GetOverlappedResult(pipe, &ov, &read, FALSE) != 0;
-        }
-        else
-        {
-            CancelIoEx(pipe, &ov);
-            appendLogLine("client-read-timeout");
-        }
-    }
-    CloseHandle(ov.hEvent);
-
-    if (!readOk || read == 0)
-    {
-        return;
-    }
-
-    const std::string request(buffer.data(), read);
-    const auto trimmed = trimWhitespace(request);
-    if (trimmed.empty())
-    {
-        return;
-    }
-    const auto response = buildResponse(trimmed);
-    DWORD written = 0;
-    WriteFile(pipe, response.data(), static_cast<DWORD>(response.size()), &written, nullptr);
-    FlushFileBuffers(pipe);
-}
-
-std::string ControlPlane::buildResponse(const std::string& request)
-{
-    if (request == "PING")
-    {
-        return respondPing();
-    }
-    if (request == "STATE" || request.rfind("STATE|", 0) == 0)
-    {
-        std::optional<size_t> tabIdx;
-        if (request.rfind("STATE|", 0) == 0)
-        {
-            const auto arg = request.substr(6);
-            if (!arg.empty())
-            {
-                try { tabIdx = static_cast<size_t>(std::stoull(arg)); }
-                catch (...) { return "ERR|" + _sessionName + "|invalid-argument\n"; }
-            }
-        }
-        return respondState(tabIdx);
-    }
-    if (request == "TAIL" || request.rfind("TAIL|", 0) == 0)
-    {
-        size_t lines = 20;
-        if (request.rfind("TAIL|", 0) == 0)
-        {
-            const auto arg = request.substr(5);
-            if (!arg.empty())
-            {
-                try { lines = static_cast<size_t>(std::stoull(arg)); }
-                catch (...) { return "ERR|" + _sessionName + "|invalid-argument\n"; }
-            }
-        }
-        return respondTail(lines);
-    }
-    if (request == "LIST_TABS")
-    {
-        return respondListTabs();
-    }
-    if (request.rfind("MSG|", 0) == 0)
-    {
-        return respondMsg(request.substr(4));
-    }
-    if (request.rfind("INPUT|", 0) == 0 || request.rfind("RAW_INPUT|", 0) == 0)
-    {
-        const bool raw = request.rfind("RAW_INPUT|", 0) == 0;
-        const auto payload = request.substr(raw ? 10 : 6);
-        const auto sep = payload.find('|');
-        if (sep == std::string::npos)
-        {
-            return "ERR|" + _sessionName + "|invalid-input\n";
-        }
-        const auto from = payload.substr(0, sep);
-        const auto encoded = payload.substr(sep + 1);
-        std::vector<uint8_t> decoded;
-        if (!decodeBase64(encoded, decoded))
-        {
-            return "ERR|" + _sessionName + "|invalid-base64\n";
-        }
-        const auto decodedSize = decoded.size();
-        const auto beforeSnapshot = captureTailContent(5);
-        if (!enqueueInput(std::string(from), std::move(decoded), raw))
-        {
-            return "ERR|" + _sessionName + "|enqueue-failed\n";
-        }
-        drainPendingInputs();
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        const auto afterSnapshot = captureTailContent(5);
-        const bool bufferChanged = (beforeSnapshot != afterSnapshot);
-        appendLogLine(std::string(raw ? "RAW_INPUT" : "INPUT") + "|" + std::string(from) + "|" + std::to_string(decodedSize));
-        return "ACK|" + _sessionName + "|" + std::to_string(_pid) + "|buffer_changed=" + (bufferChanged ? "true" : "false") + "\n";
-    }
-    if (request == "NEW_TAB")
-    {
-        return respondNewTab();
-    }
-    if (request == "CLOSE_TAB" || request.rfind("CLOSE_TAB|", 0) == 0)
-    {
-        std::optional<size_t> idx;
-        if (request.rfind("CLOSE_TAB|", 0) == 0)
-        {
-            const auto arg = request.substr(10);
-            if (!arg.empty())
-            {
-                try { idx = static_cast<size_t>(std::stoull(arg)); }
-                catch (...) { return "ERR|" + _sessionName + "|invalid-argument\n"; }
-            }
-        }
-        return respondCloseTab(idx);
-    }
-    if (request.rfind("SWITCH_TAB|", 0) == 0)
-    {
-        const auto arg = request.substr(11);
-        if (arg.empty())
-        {
-            return "ERR|" + _sessionName + "|missing-tab-index\n";
-        }
-        size_t tabIdx;
-        try { tabIdx = static_cast<size_t>(std::stoull(arg)); }
-        catch (...) { return "ERR|" + _sessionName + "|invalid-argument\n"; }
-        return respondSwitchTab(tabIdx);
-    }
-    if (request == "FOCUS")
-    {
-        return respondFocus();
-    }
-    if (request == "AGENT_STATUS")
-    {
-        return respondAgentStatus();
-    }
-    if (request.rfind("SET_AGENT|", 0) == 0)
-    {
-        // SET_AGENT|<tab_index>|<agent_type>
-        const auto payload = request.substr(10);
-        const auto sep = payload.find('|');
-        if (sep == std::string::npos)
-        {
-            return "ERR|" + _sessionName + "|invalid-argument\n";
-        }
-        size_t tabIdx;
-        try { tabIdx = static_cast<size_t>(std::stoull(payload.substr(0, sep))); }
-        catch (...) { return "ERR|" + _sessionName + "|invalid-argument\n"; }
-        const auto agentType = payload.substr(sep + 1);
-        _tabAgentTypes[tabIdx] = agentType;
-        return "ACK|" + _sessionName + "|SET_AGENT|" + std::to_string(tabIdx) + "|" + agentType + "\n";
-    }
-    return "ERR|" + _sessionName + "|unknown\n";
-}
-
-std::string ControlPlane::respondPing() const
-{
-    std::ostringstream oss;
-    oss << "PONG|" << _sessionName << "|" << _pid << "|" << toHex(reinterpret_cast<uintptr_t>(_hwnd)) << "\n";
-    return oss.str();
-}
-
-std::string ControlPlane::respondState(std::optional<size_t> tabIndex)
-{
-    const auto snapshot = captureState(tabIndex);
-    std::ostringstream oss;
-    oss << "STATE|" << _sessionName << "|" << _pid << "|" << toHex(reinterpret_cast<uintptr_t>(_hwnd)) << "|";
-    oss << escapeField(snapshot.title) << "|prompt=" << (snapshot.atPrompt ? '1' : '0') << "|selection=" << (snapshot.hasSelection ? '1' : '0');
-    oss << "|pwd=" << snapshot.pwd << "|tab_count=" << snapshot.tabCount << "|active_tab=" << snapshot.activeTab << "\n";
-    return oss.str();
-}
-
-std::string ControlPlane::respondTail(size_t lines)
-{
-    const auto data = captureTailContent(lines);
-    const auto sliced = sliceLastLines(data, lines);
-    std::ostringstream oss;
-    oss << "TAIL|" << _sessionName << "|" << lines << "\n" << sliced;
-    if (!sliced.empty() && sliced.back() != '\n')
-    {
-        oss << '\n';
-    }
-    return oss.str();
-}
-
-std::string ControlPlane::respondListTabs()
-{
-    return captureTabList();
-}
-
-std::string ControlPlane::respondMsg(std::string_view payload)
-{
-    appendLogLine("MSG|" + std::string(payload));
-    return "ACK|" + _sessionName + "|" + std::to_string(_pid) + "\n";
-}
-
-std::string ControlPlane::respondNewTab()
-{
-    runVoidOnUiThread([this]() {
-        _page._OpenNewTab(nullptr);
+        return toUtf8(control.ReadEntireBuffer());
     });
-    appendLogLine("NEW_TAB");
-    return "ACK|" + _sessionName + "|NEW_TAB\n";
-}
-
-std::string ControlPlane::respondCloseTab(std::optional<size_t> index)
-{
-    const auto idx = index.value_or(0);
-    runVoidOnUiThread([this, idx]() {
-        const auto tabCount = _page._tabs.Size();
-        if (tabCount > 0 && idx < tabCount)
-        {
-            _page._CloseTabAtIndex(static_cast<uint32_t>(idx));
-        }
-    });
-    appendLogLine("CLOSE_TAB|" + std::to_string(idx));
-    return "ACK|" + _sessionName + "|CLOSE_TAB|" + std::to_string(idx) + "\n";
-}
-
-std::string ControlPlane::respondSwitchTab(size_t index)
-{
-    runVoidOnUiThread([this, index]() {
-        _page._SelectTab(static_cast<uint32_t>(index));
-    });
-    appendLogLine("SWITCH_TAB|" + std::to_string(index));
-    return "ACK|" + _sessionName + "|SWITCH_TAB|" + std::to_string(index) + "\n";
-}
-
-std::string ControlPlane::respondFocus()
-{
-    setWindowFocus();
-    appendLogLine("FOCUS");
-    return "ACK|" + _sessionName + "|FOCUS\n";
-}
-
-std::string ControlPlane::respondAgentStatus()
-{
-    // Get active tab index
-    const auto snapshot = captureState(std::nullopt);
-    const auto tabIdx = snapshot.activeTab;
-
-    const auto currentBuffer = captureTailContent(10);
-    const auto now = std::chrono::steady_clock::now();
-
-    auto& lastSnapshot = _tabBufferSnapshots[tabIdx];
-    auto& lastChangeTime = _tabBufferChangeTimes[tabIdx];
-
-    // Initialize on first call for this tab
-    if (lastSnapshot.empty() && lastChangeTime == std::chrono::steady_clock::time_point{})
-    {
-        lastSnapshot = currentBuffer;
-        lastChangeTime = now;
-    }
-
-    // Detect buffer change
-    const bool bufferChanged = (currentBuffer != lastSnapshot);
-    if (bufferChanged)
-    {
-        lastSnapshot = currentBuffer;
-        lastChangeTime = now;
-    }
-
-    // Determine ready markers per agent type
-    const auto agentIt = _tabAgentTypes.find(tabIdx);
-    const bool hasAgent = (agentIt != _tabAgentTypes.end());
-    bool agentReady = false;
-
-    if (hasAgent)
-    {
-        const auto& agentType = agentIt->second;
-        if (agentType == "gemini")
-        {
-            agentReady = currentBuffer.find("Type your message") != std::string::npos;
-        }
-        else if (agentType == "codex")
-        {
-            // Codex shows ">" at prompt and banner with version
-            agentReady = currentBuffer.find("OpenAI Codex") != std::string::npos;
-        }
-        else if (agentType == "claude")
-        {
-            // Claude Code shows "$" or ">" after initialization
-            agentReady = currentBuffer.find("$ ") != std::string::npos ||
-                         currentBuffer.find("> ") != std::string::npos;
-        }
-    }
-
-    // Determine status
-    std::string status;
-    if (currentBuffer.find("Allow once") != std::string::npos ||
-        currentBuffer.find("Action Required") != std::string::npos)
-    {
-        status = "APPROVAL";
-    }
-    else if (bufferChanged)
-    {
-        status = "WORKING";
-    }
-    else if (hasAgent && !agentReady)
-    {
-        status = "STARTING";
-    }
-    else if (hasAgent && agentReady)
-    {
-        status = "READY";
-    }
-    else
-    {
-        status = "IDLE";
-    }
-
-    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastChangeTime).count();
-
-    std::ostringstream oss;
-    oss << "AGENT_STATUS|" << _sessionName << "|" << status << "|" << ms << "|tab=" << tabIdx << "\n";
-    return oss.str();
 }
 
 bool ControlPlane::enqueueInput(std::string from, std::vector<uint8_t>&& payload, bool raw)
@@ -786,12 +412,10 @@ void ControlPlane::drainPendingInputs()
                 entry.payload.size()));
             if (entry.raw)
             {
-                // RAW_INPUT: write directly to connection (no paste wrapping)
                 control.SendInput(winrt::hstring(text));
             }
             else
             {
-                // INPUT: wrap with bracketed paste sequences if terminal supports it
                 if (control.BracketedPasteEnabled())
                 {
                     control.SendInput(winrt::hstring(L"\x1b[200~"));
@@ -807,88 +431,94 @@ void ControlPlane::drainPendingInputs()
     });
 }
 
-ControlPlane::StateSnapshot ControlPlane::captureState(std::optional<size_t> tabIndex)
+size_t ControlPlane::captureTabCount()
 {
-    return runOnUiThread<StateSnapshot>([this, tabIndex]() {
-        StateSnapshot snapshot{};
-        // T1 fix: capture Title on UI thread to avoid XAML cross-thread access crash
-        snapshot.title = toUtf8(_page.Title());
-        snapshot.tabCount = _page.NumberOfTabs();
-        snapshot.activeTab = _page._GetFocusedTabIndex().value_or(0);
-        if (const auto tab = getTabImpl(tabIndex))
+    return runOnUiThread<size_t>([this]() -> size_t {
+        return _page.NumberOfTabs();
+    });
+}
+
+size_t ControlPlane::captureActiveTab()
+{
+    return runOnUiThread<size_t>([this]() -> size_t {
+        return _page._GetFocusedTabIndex().value_or(0);
+    });
+}
+
+void ControlPlane::doSwitchTab(size_t index)
+{
+    runVoidOnUiThread([this, index]() {
+        _page._SelectTab(static_cast<uint32_t>(index));
+    });
+}
+
+void ControlPlane::doNewTab()
+{
+    runVoidOnUiThread([this]() {
+        _page._OpenNewTab(nullptr);
+    });
+}
+
+void ControlPlane::doCloseTab(size_t index)
+{
+    runVoidOnUiThread([this, index]() {
+        const auto tabCount = _page._tabs.Size();
+        if (tabCount > 0 && index < tabCount)
+        {
+            _page._CloseTabAtIndex(static_cast<uint32_t>(index));
+        }
+    });
+}
+
+void ControlPlane::doFocus()
+{
+    if (_hwnd)
+    {
+        SetForegroundWindow(_hwnd);
+    }
+}
+
+HWND ControlPlane::getHwnd() const
+{
+    return _hwnd;
+}
+
+std::string ControlPlane::captureTabTitle(size_t index)
+{
+    return runOnUiThread<std::string>([this, index]() -> std::string {
+        if (const auto tab = getTabImpl(static_cast<size_t>(index)))
+        {
+            return toUtf8(tab.value()->Title());
+        }
+        return {};
+    });
+}
+
+std::string ControlPlane::captureTabWorkingDir(size_t index)
+{
+    return runOnUiThread<std::string>([this, index]() -> std::string {
+        if (const auto tab = getTabImpl(static_cast<size_t>(index)))
         {
             const auto control = tab.value()->GetActiveTerminalControl();
-            snapshot.hasSelection = control.HasSelection();
-            snapshot.pwd = toUtf8(control.WorkingDirectory());
-            const auto buffer = toUtf8(control.ReadEntireBuffer());
-            snapshot.atPrompt = inferPromptFromViewport(buffer, snapshot.pwd, toUtf8(tab.value()->Title()));
+            return toUtf8(control.WorkingDirectory());
         }
-        return snapshot;
+        return {};
     });
 }
 
-std::string ControlPlane::captureTailContent(size_t /*lines*/) const
+bool ControlPlane::captureTabHasSelection(size_t index)
 {
-    // T5 fix: Use ReadEntireBuffer() (exposed via IDL) instead of impl-only ViewportText().
-    // sliceLastLines() will extract the requested number of trailing lines.
-    return runOnUiThread<std::string>([this]() -> std::string {
-        const auto control = getActiveControl(std::nullopt);
-        if (!control)
+    return runOnUiThread<bool>([this, index]() -> bool {
+        if (const auto tab = getTabImpl(static_cast<size_t>(index)))
         {
-            return {};
+            const auto control = tab.value()->GetActiveTerminalControl();
+            return control.HasSelection();
         }
-        return toUtf8(control.ReadEntireBuffer());
+        return false;
     });
 }
 
-std::string ControlPlane::captureTabList() const
-{
-    return runOnUiThread<std::string>([this]() {
-        std::ostringstream oss;
-        const auto tabCount = _page.NumberOfTabs();
-        const auto focused = _page._GetFocusedTabIndex().value_or(0);
-        oss << "LIST_TABS|" << tabCount << "|" << focused << "\n";
-        for (uint32_t i = 0; i < tabCount; ++i)
-        {
-            const auto tab = _page._tabs.GetAt(i);
-            if (auto tabImpl = _page._GetTabImpl(tab))
-            {
-                const auto control = tabImpl->GetActiveTerminalControl();
-                const auto title = escapeField(toUtf8(tabImpl->Title()));
-                const auto pwd = toUtf8(control.WorkingDirectory());
-                const auto buffer = toUtf8(control.ReadEntireBuffer());
-                const auto prompt = inferPromptFromViewport(buffer, pwd, title);
-                oss << "TAB|" << i << "|" << title << "|pwd=" << pwd;
-                oss << "|prompt=" << (prompt ? '1' : '0') << "|selection=" << (control.HasSelection() ? '1' : '0') << "\n";
-            }
-        }
-        return oss.str();
-    });
-}
-
-bool ControlPlane::inferPromptFromViewport(const std::string& viewport, const std::string& pwd, const std::string&) const
-{
-    const auto trimmed = trimWhitespace(viewport);
-    if (trimmed.empty())
-    {
-        return false;
-    }
-    const auto lastLine = sliceLastLines(trimmed, 1);
-    if (lastLine.empty())
-    {
-        return false;
-    }
-    const char lastChar = lastLine.back();
-    if (lastChar == '>' || lastChar == '$' || lastChar == '#')
-    {
-        return true;
-    }
-    if (!pwd.empty() && lastLine.rfind(pwd, 0) == 0)
-    {
-        return true;
-    }
-    return false;
-}
+// ──── Private helpers (retained from original) ────
 
 std::optional<winrt::com_ptr<Tab>> ControlPlane::getTabImpl(std::optional<size_t> index) const
 {
@@ -909,37 +539,6 @@ winrt::Microsoft::Terminal::Control::TermControl ControlPlane::getActiveControl(
         return tab.value()->GetActiveTerminalControl();
     }
     return nullptr;
-}
-
-bool ControlPlane::decodeBase64(std::string_view input, std::vector<uint8_t>& output) const
-{
-    output.clear();
-    int bits = 0;
-    uint32_t value = 0;
-    for (auto ch : input)
-    {
-        if (std::isspace(static_cast<unsigned char>(ch)))
-        {
-            continue;
-        }
-        const int decoded = kBase64Map[static_cast<unsigned char>(ch)];
-        if (decoded == -1)
-        {
-            return false;
-        }
-        if (decoded == -2)
-        {
-            break;
-        }
-        value = (value << 6) | decoded;
-        bits += 6;
-        if (bits >= 8)
-        {
-            bits -= 8;
-            output.push_back(static_cast<uint8_t>((value >> bits) & 0xFF));
-        }
-    }
-    return true;
 }
 
 std::string ControlPlane::toUtf8(std::wstring_view text) const
@@ -1004,52 +603,6 @@ std::string ControlPlane::sanitizeSessionName(std::string raw) const
     return sanitized;
 }
 
-std::string ControlPlane::trimWhitespace(std::string_view text) const
-{
-    size_t start = 0;
-    while (start < text.size() && std::isspace(static_cast<unsigned char>(text[start])))
-    {
-        ++start;
-    }
-    size_t end = text.size();
-    while (end > start && std::isspace(static_cast<unsigned char>(text[end - 1])))
-    {
-        --end;
-    }
-    return std::string(text.substr(start, end - start));
-}
-
-std::string ControlPlane::sliceLastLines(std::string_view text, size_t requestedLines) const
-{
-    if (text.empty() || requestedLines == 0)
-    {
-        return std::string(text);
-    }
-    size_t seen = 0;
-    size_t idx = text.size();
-    while (idx > 0)
-    {
-        --idx;
-        if (text[idx] == '\n')
-        {
-            ++seen;
-            if (seen > requestedLines)
-            {
-                return std::string(text.substr(idx + 1));
-            }
-        }
-    }
-    return std::string(text);
-}
-
-void ControlPlane::setWindowFocus() const
-{
-    if (_hwnd)
-    {
-        SetForegroundWindow(_hwnd);
-    }
-}
-
 template<typename TResult>
 TResult ControlPlane::runOnUiThread(std::function<TResult()> action) const
 {
@@ -1059,7 +612,6 @@ TResult ControlPlane::runOnUiThread(std::function<TResult()> action) const
     }
     std::promise<TResult> promise;
     auto future = promise.get_future();
-    // T3 fix: cancellation token prevents use-after-free if lambda executes after ControlPlane destruction.
     auto cancelled = _cancelled;
     try
     {
