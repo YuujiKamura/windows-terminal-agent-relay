@@ -30,8 +30,10 @@ namespace winrt::TerminalApp::implementation
 
         // ──── Public methods called from VTable callbacks ────
         std::string captureTailContent(size_t lines) const;
+        std::string captureTailContentForTab(size_t tabIndex) const;
         bool enqueueInput(std::string from, std::vector<uint8_t>&& payload, bool raw);
         void drainPendingInputs();
+        void sendInputToTab(std::vector<uint8_t> payload, bool raw, size_t tabIndex);
         size_t captureTabCount();
         size_t captureActiveTab();
         void doSwitchTab(size_t index);

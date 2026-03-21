@@ -156,6 +156,26 @@ static bool cpVt_tabHasSelection(void* ctx, size_t index)
     return cp->captureTabHasSelection(index);
 }
 
+static size_t cpVt_readBufferForTab(void* ctx, size_t tab_index, char* buf, size_t buf_len)
+{
+    auto* cp = static_cast<ControlPlane*>(ctx);
+    auto content = cp->captureTailContentForTab(tab_index);
+    if (content.empty())
+    {
+        return 0;
+    }
+    const auto copyLen = std::min(content.size(), buf_len);
+    std::memcpy(buf, content.data(), copyLen);
+    return copyLen;
+}
+
+static void cpVt_sendInputToTab(void* ctx, const uint8_t* text, size_t len, bool raw, size_t tab_index)
+{
+    auto* cp = static_cast<ControlPlane*>(ctx);
+    std::vector<uint8_t> payload(text, text + len);
+    cp->sendInputToTab(std::move(payload), raw, tab_index);
+}
+
 } // extern "C"
 
 bool ControlPlane::IsEnabled()
@@ -225,6 +245,7 @@ ControlPlane::ControlPlane(TerminalPage& page) :
     _pipeName = std::string{ kPipePrefix } + _safeSessionName + "-" + std::to_string(_pid);
     _pipePath = "\\\\.\\pipe\\" + _pipeName;
     _hwnd = _page.HostingWindow().value_or(nullptr);
+    _page._SetControlPlaneTabTitleSuffix(winrt::to_hstring(fmt::format("[cp:{}-{}]", _safeSessionName, _pid)));
 
     try
     {
@@ -289,7 +310,7 @@ void ControlPlane::initDll()
     // Layout must match the Rust repr(C) struct exactly:
     //   read_buffer, send_input, tab_count, active_tab, switch_tab,
     //   new_tab, close_tab, focus, hwnd, tab_title, tab_working_dir,
-    //   tab_has_selection, ctx
+    //   tab_has_selection, read_buffer_for_tab, ctx
     struct TerminalProviderVTable
     {
         decltype(&cpVt_readBuffer)      read_buffer;
@@ -304,6 +325,8 @@ void ControlPlane::initDll()
         decltype(&cpVt_tabTitle)        tab_title;
         decltype(&cpVt_tabWorkingDir)   tab_working_dir;
         decltype(&cpVt_tabHasSelection) tab_has_selection;
+        decltype(&cpVt_readBufferForTab) read_buffer_for_tab;
+        decltype(&cpVt_sendInputToTab)  send_input_to_tab;
         void*                           ctx;
     };
 
@@ -320,6 +343,8 @@ void ControlPlane::initDll()
     vtable.tab_title        = cpVt_tabTitle;
     vtable.tab_working_dir  = cpVt_tabWorkingDir;
     vtable.tab_has_selection = cpVt_tabHasSelection;
+    vtable.read_buffer_for_tab = cpVt_readBufferForTab;
+    vtable.send_input_to_tab   = cpVt_sendInputToTab;
     vtable.ctx              = static_cast<void*>(this);
 
     _dllServer = fnCreate(_sessionName.c_str(), "windows-terminal-winui3", &vtable);
@@ -366,6 +391,18 @@ std::string ControlPlane::captureTailContent(size_t /*lines*/) const
 {
     return runOnUiThread<std::string>([this]() -> std::string {
         const auto control = getActiveControl(std::nullopt);
+        if (!control)
+        {
+            return {};
+        }
+        return toUtf8(control.ReadEntireBuffer());
+    });
+}
+
+std::string ControlPlane::captureTailContentForTab(size_t tabIndex) const
+{
+    return runOnUiThread<std::string>([this, tabIndex]() -> std::string {
+        const auto control = getActiveControl(tabIndex);
         if (!control)
         {
             return {};
@@ -426,6 +463,37 @@ void ControlPlane::drainPendingInputs()
                 {
                     control.SendInput(winrt::hstring(text));
                 }
+            }
+        }
+    });
+}
+
+void ControlPlane::sendInputToTab(std::vector<uint8_t> payload, bool raw, size_t tabIndex)
+{
+    runVoidOnUiThread([this, payload = std::move(payload), raw, tabIndex]() {
+        const auto control = getActiveControl(tabIndex);
+        if (!control)
+        {
+            return;
+        }
+        const auto text = fromUtf8(std::string_view(
+            reinterpret_cast<const char*>(payload.data()),
+            payload.size()));
+        if (raw)
+        {
+            control.SendInput(winrt::hstring(text));
+        }
+        else
+        {
+            if (control.BracketedPasteEnabled())
+            {
+                control.SendInput(winrt::hstring(L"\x1b[200~"));
+                control.SendInput(winrt::hstring(text));
+                control.SendInput(winrt::hstring(L"\x1b[201~"));
+            }
+            else
+            {
+                control.SendInput(winrt::hstring(text));
             }
         }
     });
