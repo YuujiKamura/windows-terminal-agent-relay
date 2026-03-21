@@ -493,13 +493,29 @@ namespace winrt::TerminalApp::implementation
         ASSERT_UI_THREAD();
 
         const auto activeTitle = _GetActiveTitle();
+        const auto displayedTitle = _titleSuffix.empty() ?
+                                        activeTitle :
+                                        til::hstring_format(FMT_COMPILE(L"{} {}"), activeTitle, _titleSuffix);
         // Bubble our current tab text to anyone who's listening for changes.
         Title(activeTitle);
 
         // Update the control to reflect the changed title
-        _headerControl.Title(activeTitle);
-        Automation::AutomationProperties::SetName(TabViewItem(), activeTitle);
+        _headerControl.Title(displayedTitle);
+        Automation::AutomationProperties::SetName(TabViewItem(), displayedTitle);
         _UpdateToolTip();
+    }
+
+    void Tab::SetTitleSuffix(winrt::hstring suffix)
+    {
+        ASSERT_UI_THREAD();
+
+        if (_titleSuffix == suffix)
+        {
+            return;
+        }
+
+        _titleSuffix = std::move(suffix);
+        UpdateTitle();
     }
 
     // Method Description:

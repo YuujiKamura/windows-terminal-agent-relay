@@ -2023,6 +2023,8 @@ namespace winrt::TerminalApp::implementation
     // - hostingTab: The Tab that's hosting this TermControl instance
     void TerminalPage::_RegisterTabEvents(Tab& hostingTab)
     {
+        hostingTab.SetTitleSuffix(_controlPlaneTabTitleSuffix);
+
         auto weakTab{ hostingTab.get_weak() };
         auto weakThis{ get_weak() };
         // PropertyChanged is the generic mechanism by which the Tab
@@ -4402,6 +4404,19 @@ namespace winrt::TerminalApp::implementation
         winrt::com_ptr<Tab> tabImpl;
         tabImpl.copy_from(winrt::get_self<Tab>(tab));
         return tabImpl;
+    }
+
+    void TerminalPage::_SetControlPlaneTabTitleSuffix(const winrt::hstring& suffix)
+    {
+        _controlPlaneTabTitleSuffix = suffix;
+
+        for (const auto& tab : _tabs)
+        {
+            if (auto tabImpl{ _GetTabImpl(tab) })
+            {
+                tabImpl->SetTitleSuffix(_controlPlaneTabTitleSuffix);
+            }
+        }
     }
 
     // Method Description:

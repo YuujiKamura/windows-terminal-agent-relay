@@ -237,6 +237,7 @@ namespace winrt::TerminalApp::implementation
         static winrt::com_ptr<Tab> _GetTabImpl(const TerminalApp::Tab& tab);
 
         void _UpdateTabIndices();
+        void _SetControlPlaneTabTitleSuffix(const winrt::hstring& suffix);
 
         TerminalApp::Tab _settingsTab{ nullptr };
 
@@ -285,6 +286,7 @@ namespace winrt::TerminalApp::implementation
         PaneResources _paneResources;
 
         TerminalApp::ContentManager _manager{ nullptr };
+        winrt::hstring _controlPlaneTabTitleSuffix{};
 
         std::shared_ptr<TerminalSettingsCache> _terminalSettingsCache{};
 
