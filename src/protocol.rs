@@ -126,6 +126,39 @@ mod tests {
     }
 
     #[test]
+    fn test_input_cjk_message() {
+        // CJK text should be properly base64-encoded
+        let cjk = "あいうえおかきくけこ";
+        let msg = input("agent-ctl", cjk);
+        assert!(msg.starts_with("INPUT|agent-ctl|"));
+        // Verify round-trip: extract base64 payload and decode
+        let payload_b64 = msg.strip_prefix("INPUT|agent-ctl|").unwrap();
+        let decoded = STANDARD.decode(payload_b64).unwrap();
+        let decoded_str = String::from_utf8(decoded).unwrap();
+        assert_eq!(decoded_str, cjk);
+    }
+
+    #[test]
+    fn test_input_long_cjk_message() {
+        // Long CJK text (90+ chars) should encode/decode correctly
+        let long_cjk = "これは非常に長い日本語テキストです。表示テストのため送信しています。全角文字の幅計算が正しく行われているかを確認します。";
+        let msg = input("agent-ctl", long_cjk);
+        let payload_b64 = msg.strip_prefix("INPUT|agent-ctl|").unwrap();
+        let decoded = STANDARD.decode(payload_b64).unwrap();
+        let decoded_str = String::from_utf8(decoded).unwrap();
+        assert_eq!(decoded_str, long_cjk);
+    }
+
+    #[test]
+    fn test_raw_input_cjk() {
+        let cjk = "漢字テスト";
+        let msg = raw_input("agent-ctl", cjk);
+        let payload_b64 = msg.strip_prefix("RAW_INPUT|agent-ctl|").unwrap();
+        let decoded = STANDARD.decode(payload_b64).unwrap();
+        assert_eq!(String::from_utf8(decoded).unwrap(), cjk);
+    }
+
+    #[test]
     fn test_is_error() {
         assert_eq!(
             is_error("ERR|session|unknown\n"),
