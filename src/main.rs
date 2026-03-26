@@ -130,8 +130,18 @@ enum Commands {
     RawSend {
         /// Session name or hint
         session: String,
-        /// Text to send raw
+        /// Text to send raw (ignored if --ctrl-c/--ctrl-d/--ctrl-z is set)
+        #[clap(default_value = "")]
         text: String,
+        /// Send Ctrl+C (0x03 ETX) to interrupt the running process
+        #[clap(long)]
+        ctrl_c: bool,
+        /// Send Ctrl+D (0x04 EOT) to signal end-of-input
+        #[clap(long)]
+        ctrl_d: bool,
+        /// Send Ctrl+Z (0x1a SUB) to suspend the running process
+        #[clap(long)]
+        ctrl_z: bool,
     },
     /// Send STATE request, print response
     State {
@@ -231,7 +241,18 @@ fn main() {
             agent_type,
         } => commands::stop::run(backend.as_ref(), &session, &agent_type),
         Commands::Ping { session } => commands::ping::run(backend.as_ref(), &session),
-        Commands::RawSend { session, text } => commands::raw_send::run(backend.as_ref(), &session, &text),
+        Commands::RawSend { session, text, ctrl_c, ctrl_d, ctrl_z } => {
+            let payload = if ctrl_c {
+                "\x03".to_string()
+            } else if ctrl_d {
+                "\x04".to_string()
+            } else if ctrl_z {
+                "\x1a".to_string()
+            } else {
+                text
+            };
+            commands::raw_send::run(backend.as_ref(), &session, &payload)
+        },
         Commands::State { session } => commands::state::run(backend.as_ref(), &session),
         Commands::Tabs { session } => commands::tabs::run(backend.as_ref(), &session),
         #[cfg(feature = "bridge")]

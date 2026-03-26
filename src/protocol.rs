@@ -102,6 +102,30 @@ mod tests {
     }
 
     #[test]
+    fn test_raw_input_ctrl_c() {
+        let msg = raw_input("agent-ctl", "\x03");
+        assert!(msg.starts_with("RAW_INPUT|agent-ctl|"));
+        // \x03 base64-encoded is "Aw=="
+        assert!(msg.ends_with("Aw=="), "Expected base64 of \\x03, got: {}", msg);
+    }
+
+    #[test]
+    fn test_raw_input_ctrl_d() {
+        let msg = raw_input("agent-ctl", "\x04");
+        assert!(msg.starts_with("RAW_INPUT|agent-ctl|"));
+        // \x04 base64-encoded is "BA=="
+        assert!(msg.ends_with("BA=="), "Expected base64 of \\x04, got: {}", msg);
+    }
+
+    #[test]
+    fn test_raw_input_ctrl_z() {
+        let msg = raw_input("agent-ctl", "\x1a");
+        assert!(msg.starts_with("RAW_INPUT|agent-ctl|"));
+        // \x1a base64-encoded is "Gg=="
+        assert!(msg.ends_with("Gg=="), "Expected base64 of \\x1a, got: {}", msg);
+    }
+
+    #[test]
     fn test_is_error() {
         assert_eq!(
             is_error("ERR|session|unknown\n"),
