@@ -1,12 +1,14 @@
-pub mod wt;
+pub mod control_plane;
 // Future backends:
 // pub mod tmux;
 // pub mod ssh;
 
+pub use control_plane::ControlPlaneBackend;
+
 use crate::error::Result;
 use crate::session::SessionInfo;
 
-pub trait AgentBackend {
+pub trait AgentBackend: Send + Sync {
     fn list(&self) -> Result<Vec<SessionInfo>>;
     fn send(&self, session_hint: &str, text: &str) -> Result<()>;
     fn read(&self, session_hint: &str, lines: usize, tab_index: Option<usize>) -> Result<String>;
@@ -23,4 +25,8 @@ pub trait AgentBackend {
     fn state(&self, session_hint: &str) -> Result<String>;
     /// Send LIST_TABS request, return raw response
     fn tabs(&self, session_hint: &str) -> Result<String>;
+    /// Send PASTE request
+    fn paste(&self, session_hint: &str, text: &str, tab: Option<&str>) -> Result<()>;
+    /// Send WAIT_FOR request
+    fn wait_for(&self, session_hint: &str, pattern: &str, timeout_ms: u32, tab: Option<&str>) -> Result<String>;
 }

@@ -9,13 +9,13 @@ mod pipe;
 mod protocol;
 mod session;
 
-use backend::{AgentBackend, wt::WtBackend};
+use backend::{AgentBackend, control_plane::ControlPlaneBackend};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "agent-ctl", about = "Agent Control Plane CLI")]
 struct Cli {
-    /// Backend to use: wt
+    /// Backend to use: wt, ghostty
     #[arg(long, default_value = "wt")]
     backend: String,
 
@@ -148,6 +148,29 @@ enum Commands {
         /// Session name or hint
         session: String,
     },
+    /// Send PASTE request (bracketed paste)
+    Paste {
+        /// Session name or hint
+        session: String,
+        /// Text to paste
+        text: String,
+        /// Tab index or id
+        #[arg(long)]
+        tab: Option<String>,
+    },
+    /// Send WAIT_FOR request
+    WaitFor {
+        /// Session name or hint
+        session: String,
+        /// Pattern to wait for
+        pattern: String,
+        /// Timeout in milliseconds
+        #[arg(long, default_value = "5000")]
+        timeout: u32,
+        /// Tab index or id
+        #[arg(long)]
+        tab: Option<String>,
+    },
     /// Send LIST_TABS request, print response
     Tabs {
         /// Session name or hint
@@ -200,7 +223,7 @@ fn main() {
     let cli = Cli::parse();
 
     let backend: Box<dyn AgentBackend> = match cli.backend.as_str() {
-        "wt" => Box::new(WtBackend),
+        "wt" | "ghostty" => Box::new(ControlPlaneBackend),
         other => {
             eprintln!("Error: Unknown backend '{}'", other);
             std::process::exit(1);
@@ -254,6 +277,10 @@ fn main() {
             commands::raw_send::run(backend.as_ref(), &session, &payload)
         },
         Commands::State { session } => commands::state::run(backend.as_ref(), &session),
+        Commands::Paste { session, text, tab } => commands::paste::run(backend.as_ref(), &session, &text, tab.as_deref()),
+        Commands::WaitFor { session, pattern, timeout, tab } => {
+            commands::wait_for::run(backend.as_ref(), &session, &pattern, timeout, tab.as_deref())
+        },
         Commands::Tabs { session } => commands::tabs::run(backend.as_ref(), &session),
         #[cfg(feature = "bridge")]
         Commands::Bridge { pipe_name } => bridge::run(pipe_name.as_deref()),

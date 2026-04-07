@@ -15,6 +15,7 @@ pub fn run(backend: &dyn AgentBackend, alive_only: bool, json: bool) -> Result<(
                     "pid": s.pid,
                     "pipe_name": s.pipe_name,
                     "alive": is_process_alive(s.pid),
+                    "terminal": s.terminal_type,
                 })
             })
             .collect();
@@ -31,8 +32,8 @@ pub fn run(backend: &dyn AgentBackend, alive_only: bool, json: bool) -> Result<(
             }
             let status = if alive { "ALIVE" } else { "DEAD" };
             println!(
-                "{} | session={} | pid={} | pipe={}",
-                status, s.session_name, s.pid, s.pipe_name
+                "{} | {:<15} | session={:<20} | pid={:<6} | pipe={}",
+                status, format!("{:?}", s.terminal_type), s.session_name, s.pid, s.pipe_name
             );
         }
     }

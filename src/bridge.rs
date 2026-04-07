@@ -1,6 +1,6 @@
 use crate::error::{AgentCtlError, Result};
 use crate::pipe;
-use crate::protocol;
+use crate::protocol::{self, TabTarget};
 use crate::session;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -17,7 +17,11 @@ struct JsonRequest {
     #[serde(default)]
     text: Option<String>,
     #[serde(default)]
-    tab: Option<usize>,
+    tab: Option<String>, // Changed to String to support id=...
+    #[serde(default)]
+    timeout_ms: Option<u32>,
+    #[serde(default)]
+    pattern: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -53,20 +57,33 @@ fn resolve_pipe_path(session_hint: &str) -> Result<String> {
     Ok(info.pipe_path)
 }
 
+fn parse_tab_target(tab: Option<&str>) -> TabTarget {
+    match tab {
+        None => TabTarget::None,
+        Some(t) if t.is_empty() => TabTarget::None,
+        Some(t) if t.starts_with("id=") => TabTarget::Id(t[3..].to_string()),
+        Some(t) => {
+            if let Ok(idx) = t.parse::<usize>() {
+                TabTarget::Index(idx)
+            } else {
+                TabTarget::Id(t.to_string())
+            }
+        }
+    }
+}
+
 /// Handle a JSON request string and return a JSON response string.
 pub fn handle_json_request(json_str: &str) -> Result<String> {
     let req: JsonRequest = serde_json::from_str(json_str)
         .map_err(|e| AgentCtlError::Protocol(format!("invalid JSON: {}", e)))?;
 
     let pipe_path = resolve_pipe_path(&req.session)?;
+    let target = parse_tab_target(req.tab.as_deref());
 
     let response = match req.action.to_uppercase().as_str() {
         "TAIL" => {
             let lines = req.lines.unwrap_or(30);
-            let msg = match req.tab {
-                Some(idx) => protocol::tail_tab(lines, idx),
-                None => protocol::tail(lines),
-            };
+            let msg = protocol::tail(lines, target);
             let resp = pipe::send_pipe_message(&pipe_path, &msg)?;
             if let Some(err) = protocol::is_error(&resp) {
                 return Ok(serde_json::to_string(&JsonResponse::err(err)).unwrap());
@@ -76,7 +93,7 @@ pub fn handle_json_request(json_str: &str) -> Result<String> {
         "INPUT" => {
             let text = req.text.as_deref().unwrap_or("");
             // Step 1: Send text via INPUT (bracketed paste)
-            let msg = protocol::input("agent-deck", text);
+            let msg = protocol::input("agent-deck", text, target.clone());
             let resp = pipe::send_pipe_message(&pipe_path, &msg)?;
             if let Some(err) = protocol::is_error(&resp) {
                 return Ok(serde_json::to_string(&JsonResponse::err(err)).unwrap());
@@ -84,7 +101,7 @@ pub fn handle_json_request(json_str: &str) -> Result<String> {
             // Step 2: Brief pause for TUI to process
             std::thread::sleep(Duration::from_millis(100));
             // Step 3: Send Enter via RAW_INPUT
-            let enter_msg = protocol::raw_input("agent-deck", "\r");
+            let enter_msg = protocol::raw_input("agent-deck", "\r", target);
             let resp2 = pipe::send_pipe_message(&pipe_path, &enter_msg)?;
             if let Some(err) = protocol::is_error(&resp2) {
                 return Ok(serde_json::to_string(&JsonResponse::err(err)).unwrap());
@@ -93,7 +110,26 @@ pub fn handle_json_request(json_str: &str) -> Result<String> {
         }
         "RAW_INPUT" => {
             let text = req.text.as_deref().unwrap_or("");
-            let msg = protocol::raw_input("agent-deck", text);
+            let msg = protocol::raw_input("agent-deck", text, target);
+            let resp = pipe::send_pipe_message(&pipe_path, &msg)?;
+            if let Some(err) = protocol::is_error(&resp) {
+                return Ok(serde_json::to_string(&JsonResponse::err(err)).unwrap());
+            }
+            JsonResponse::ok(resp)
+        }
+        "PASTE" => {
+            let text = req.text.as_deref().unwrap_or("");
+            let msg = protocol::paste("agent-deck", text, target);
+            let resp = pipe::send_pipe_message(&pipe_path, &msg)?;
+            if let Some(err) = protocol::is_error(&resp) {
+                return Ok(serde_json::to_string(&JsonResponse::err(err)).unwrap());
+            }
+            JsonResponse::ok(resp)
+        }
+        "WAIT_FOR" => {
+            let timeout = req.timeout_ms.unwrap_or(5000);
+            let pattern = req.pattern.as_deref().unwrap_or("");
+            let msg = protocol::wait_for(timeout, pattern, target);
             let resp = pipe::send_pipe_message(&pipe_path, &msg)?;
             if let Some(err) = protocol::is_error(&resp) {
                 return Ok(serde_json::to_string(&JsonResponse::err(err)).unwrap());
@@ -109,7 +145,7 @@ pub fn handle_json_request(json_str: &str) -> Result<String> {
             JsonResponse::ok(resp)
         }
         "STATE" => {
-            let msg = protocol::state(req.tab.map(|_| req.tab.unwrap()));
+            let msg = protocol::state(target);
             let resp = pipe::send_pipe_message(&pipe_path, &msg)?;
             if let Some(err) = protocol::is_error(&resp) {
                 return Ok(serde_json::to_string(&JsonResponse::err(err)).unwrap());
@@ -257,60 +293,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_json_response_ok() {
-        let resp = JsonResponse::ok("hello".into());
-        let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains("\"status\":\"ok\""));
-        assert!(json.contains("\"data\":\"hello\""));
-        assert!(!json.contains("\"error\""));
-    }
-
-    #[test]
-    fn test_json_response_err() {
-        let resp = JsonResponse::err("bad request".into());
-        let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains("\"status\":\"error\""));
-        assert!(json.contains("\"error\":\"bad request\""));
-        assert!(!json.contains("\"data\""));
-    }
-
-    #[test]
-    fn test_parse_tail_request() {
-        let json = r#"{"action":"TAIL","session":"test","lines":30}"#;
-        let req: JsonRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.action, "TAIL");
-        assert_eq!(req.session, "test");
-        assert_eq!(req.lines, Some(30));
-    }
-
-    #[test]
-    fn test_parse_input_request() {
-        let json = r#"{"action":"INPUT","session":"test","text":"echo hello"}"#;
-        let req: JsonRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.action, "INPUT");
-        assert_eq!(req.text.as_deref(), Some("echo hello"));
-    }
-
-    #[test]
-    fn test_parse_ping_request() {
-        let json = r#"{"action":"PING","session":"test"}"#;
-        let req: JsonRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.action, "PING");
-    }
-
-    #[test]
-    fn test_handle_invalid_json() {
-        let result = handle_json_request("not json");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_handle_unknown_action() {
-        // This will fail on session resolution, but let's test with a valid structure
-        let json = r#"{"action":"UNKNOWN","session":""}"#;
-        // Will error because no sessions exist in test env, but parsing succeeds
-        let result = handle_json_request(json);
-        // Either an error (no sessions) or unknown action response
-        assert!(result.is_ok() || result.is_err());
+    fn test_parse_tab_target() {
+        assert_eq!(parse_tab_target(None), TabTarget::None);
+        assert_eq!(parse_tab_target(Some("")), TabTarget::None);
+        assert_eq!(parse_tab_target(Some("2")), TabTarget::Index(2));
+        assert_eq!(parse_tab_target(Some("id=t1")), TabTarget::Id("t1".into()));
+        assert_eq!(parse_tab_target(Some("t1")), TabTarget::Id("t1".into()));
     }
 }

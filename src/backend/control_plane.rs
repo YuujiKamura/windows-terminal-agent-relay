@@ -3,13 +3,13 @@ use crate::error::{AgentCtlError, Result};
 #[cfg(feature = "librarian")]
 use crate::librarian::AgentState;
 use crate::pipe;
-use crate::protocol;
+use crate::protocol::{self, TabTarget};
 use crate::session::{self, SessionInfo};
 use std::time::{Duration, Instant};
 
-pub struct WtBackend;
+pub struct ControlPlaneBackend;
 
-impl AgentBackend for WtBackend {
+impl AgentBackend for ControlPlaneBackend {
     fn list(&self) -> Result<Vec<SessionInfo>> {
         Ok(session::discover_sessions())
     }
@@ -17,7 +17,7 @@ impl AgentBackend for WtBackend {
     fn send(&self, session_hint: &str, text: &str) -> Result<()> {
         let s = session::find_session(session_hint)?;
         // Step 1: Send text via INPUT (bracketed paste)
-        let msg = protocol::input("agent-ctl", text);
+        let msg = protocol::input("agent-ctl", text, TabTarget::None);
         let response = pipe::send_pipe_message(&s.pipe_path, &msg)?;
         if let Some(err) = protocol::is_error(&response) {
             return Err(AgentCtlError::ServerError(err));
@@ -25,7 +25,7 @@ impl AgentBackend for WtBackend {
         // Step 2: Wait for TUI to process INPUT before sending Enter
         std::thread::sleep(Duration::from_secs(1));
         // Step 3: Send Enter via RAW_INPUT (separate from INPUT so TUI treats it as submit)
-        let enter_msg = protocol::raw_input("agent-ctl", "\r");
+        let enter_msg = protocol::raw_input("agent-ctl", "\r", TabTarget::None);
         let response2 = pipe::send_pipe_message(&s.pipe_path, &enter_msg)?;
         if let Some(err) = protocol::is_error(&response2) {
             return Err(AgentCtlError::ServerError(err));
@@ -35,10 +35,11 @@ impl AgentBackend for WtBackend {
 
     fn read(&self, session_hint: &str, lines: usize, tab_index: Option<usize>) -> Result<String> {
         let s = session::find_session(session_hint)?;
-        let msg = match tab_index {
-            Some(idx) => protocol::tail_tab(lines, idx),
-            None => protocol::tail(lines),
+        let target = match tab_index {
+            Some(idx) => TabTarget::Index(idx),
+            None => TabTarget::None,
         };
+        let msg = protocol::tail(lines, target);
         let response = pipe::send_pipe_message(&s.pipe_path, &msg)?;
         if let Some(err) = protocol::is_error(&response) {
             return Err(AgentCtlError::ServerError(err));
@@ -60,7 +61,7 @@ impl AgentBackend for WtBackend {
                 return Err(AgentCtlError::WaitTimeout(timeout_secs));
             }
 
-            let tail_resp = match pipe::send_pipe_message(&s.pipe_path, &protocol::tail(20)) {
+            let tail_resp = match pipe::send_pipe_message(&s.pipe_path, &protocol::tail(20, TabTarget::None)) {
                 Ok(r) => r,
                 Err(_) => { std::thread::sleep(poll_interval); continue; }
             };
@@ -84,7 +85,7 @@ impl AgentBackend for WtBackend {
                     }
                     if !approval_sent {
                         eprintln!("[wait] AGENT_APPROVAL detected, sending approval...");
-                        let msg = protocol::raw_input("agent-ctl", "1");
+                        let msg = protocol::raw_input("agent-ctl", "1", TabTarget::None);
                         let _ = pipe::send_pipe_message(&s.pipe_path, &msg);
                         approval_sent = true;
                     }
@@ -136,7 +137,7 @@ impl AgentBackend for WtBackend {
 
     fn approve(&self, session_hint: &str) -> Result<()> {
         let s = session::find_session(session_hint)?;
-        let msg = protocol::raw_input("agent-ctl", "y\r");
+        let msg = protocol::raw_input("agent-ctl", "y\r", TabTarget::None);
         let response = pipe::send_pipe_message(&s.pipe_path, &msg)?;
         if let Some(err) = protocol::is_error(&response) {
             return Err(AgentCtlError::ServerError(err));
@@ -146,13 +147,19 @@ impl AgentBackend for WtBackend {
 
     fn tab(&self, session_hint: &str, action: &str, index: Option<usize>) -> Result<String> {
         let s = session::find_session(session_hint)?;
+        let target = match index {
+            Some(idx) => TabTarget::Index(idx),
+            None => TabTarget::None,
+        };
         let msg = match action {
             "new" => protocol::new_tab(),
             "switch" => {
-                let idx = index.expect("tab switch requires an index");
-                protocol::switch_tab(idx)
+                if matches!(target, TabTarget::None) {
+                    return Err(AgentCtlError::Other("tab switch requires an index".into()));
+                }
+                protocol::switch_tab(target)
             }
-            "close" => protocol::close_tab(index),
+            "close" => protocol::close_tab(target),
             "list" => protocol::list_tabs(),
             other => return Err(AgentCtlError::Other(format!("Unknown tab action: {}", other))),
         };
@@ -173,7 +180,7 @@ impl AgentBackend for WtBackend {
             "codex" => "codex",
             other => other,
         };
-        let launch_msg = protocol::raw_input("agent-ctl", &format!("{}\r", agent_cmd));
+        let launch_msg = protocol::raw_input("agent-ctl", &format!("{}\r", agent_cmd), TabTarget::None);
         let _ = pipe::send_pipe_message(&s.pipe_path, &launch_msg);
 
         let deadline = Instant::now() + Duration::from_secs(60);
@@ -183,7 +190,7 @@ impl AgentBackend for WtBackend {
                 break;
             }
             std::thread::sleep(Duration::from_secs(2));
-            if let Ok(tail) = pipe::send_pipe_message(&s.pipe_path, &protocol::tail(10)) {
+            if let Ok(tail) = pipe::send_pipe_message(&s.pipe_path, &protocol::tail(10, TabTarget::None)) {
                 let buf = tail.splitn(2, '\n').nth(1).unwrap_or("");
                 let last = buf.lines().last().unwrap_or("");
                 eprintln!("[launch] ... {}", last);
@@ -196,9 +203,9 @@ impl AgentBackend for WtBackend {
         }
 
         if let Some(prompt_text) = prompt {
-            let input_msg = protocol::input("agent-ctl", prompt_text);
+            let input_msg = protocol::input("agent-ctl", prompt_text, TabTarget::None);
             let _ = pipe::send_pipe_message(&s.pipe_path, &input_msg);
-            let enter_msg = protocol::raw_input("agent-ctl", "\r");
+            let enter_msg = protocol::raw_input("agent-ctl", "\r", TabTarget::None);
             let _ = pipe::send_pipe_message(&s.pipe_path, &enter_msg);
         }
         Ok(())
@@ -217,7 +224,7 @@ impl AgentBackend for WtBackend {
 
     fn raw_send(&self, session_hint: &str, text: &str) -> Result<()> {
         let s = session::find_session(session_hint)?;
-        let msg = protocol::raw_input("agent-ctl", text);
+        let msg = protocol::raw_input("agent-ctl", text, TabTarget::None);
         let response = pipe::send_pipe_message(&s.pipe_path, &msg)?;
         if let Some(err) = protocol::is_error(&response) {
             return Err(AgentCtlError::ServerError(err));
@@ -227,7 +234,7 @@ impl AgentBackend for WtBackend {
 
     fn state(&self, session_hint: &str) -> Result<String> {
         let s = session::find_session(session_hint)?;
-        let resp = pipe::send_pipe_message(&s.pipe_path, &protocol::state(None))?;
+        let resp = pipe::send_pipe_message(&s.pipe_path, &protocol::state(TabTarget::None))?;
         Ok(resp)
     }
 
@@ -237,29 +244,66 @@ impl AgentBackend for WtBackend {
         Ok(resp)
     }
 
+    fn paste(&self, session_hint: &str, text: &str, tab: Option<&str>) -> Result<()> {
+        let s = session::find_session(session_hint)?;
+        let target = parse_tab_str(tab);
+        let msg = protocol::paste("agent-ctl", text, target);
+        let response = pipe::send_pipe_message(&s.pipe_path, &msg)?;
+        if let Some(err) = protocol::is_error(&response) {
+            return Err(AgentCtlError::ServerError(err));
+        }
+        Ok(())
+    }
+
+    fn wait_for(&self, session_hint: &str, pattern: &str, timeout_ms: u32, tab: Option<&str>) -> Result<String> {
+        let s = session::find_session(session_hint)?;
+        let target = parse_tab_str(tab);
+        let msg = protocol::wait_for(timeout_ms, pattern, target);
+        let resp = pipe::send_pipe_message(&s.pipe_path, &msg)?;
+        if let Some(err) = protocol::is_error(&resp) {
+            return Err(AgentCtlError::ServerError(err));
+        }
+        Ok(resp)
+    }
+
     fn stop(&self, session_hint: &str, agent_type: &str) -> Result<()> {
         let s = session::find_session(session_hint)?;
 
         match agent_type {
             "claude" => {
-                let ctrl_c = protocol::raw_input("agent-ctl", "\x03");
+                let ctrl_c = protocol::raw_input("agent-ctl", "\x03", TabTarget::None);
                 let _ = pipe::send_pipe_message(&s.pipe_path, &ctrl_c);
                 std::thread::sleep(std::time::Duration::from_millis(500));
                 let _ = pipe::send_pipe_message(&s.pipe_path, &ctrl_c);
             }
             "gemini" => {
-                let ctrl_c = protocol::raw_input("agent-ctl", "\x03");
+                let ctrl_c = protocol::raw_input("agent-ctl", "\x03", TabTarget::None);
                 let _ = pipe::send_pipe_message(&s.pipe_path, &ctrl_c);
             }
             "codex" => {
-                let exit_msg = protocol::raw_input("agent-ctl", "/exit\r");
+                let exit_msg = protocol::raw_input("agent-ctl", "/exit\r", TabTarget::None);
                 let _ = pipe::send_pipe_message(&s.pipe_path, &exit_msg);
             }
             _ => {
-                let ctrl_c = protocol::raw_input("agent-ctl", "\x03");
+                let ctrl_c = protocol::raw_input("agent-ctl", "\x03", TabTarget::None);
                 let _ = pipe::send_pipe_message(&s.pipe_path, &ctrl_c);
             }
         }
         Ok(())
+    }
+}
+
+fn parse_tab_str(tab: Option<&str>) -> TabTarget {
+    match tab {
+        None => TabTarget::None,
+        Some(t) if t.is_empty() => TabTarget::None,
+        Some(t) if t.starts_with("id=") => TabTarget::Id(t[3..].to_string()),
+        Some(t) => {
+            if let Ok(idx) = t.parse::<usize>() {
+                TabTarget::Index(idx)
+            } else {
+                TabTarget::Id(t.to_string())
+            }
+        }
     }
 }

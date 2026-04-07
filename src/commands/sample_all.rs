@@ -14,7 +14,7 @@ use crate::backend::AgentBackend;
 use crate::error::{AgentCtlError, Result};
 use crate::librarian;
 use crate::pipe;
-use crate::protocol;
+use crate::protocol::{self, TabTarget};
 use crate::session;
 use std::fs;
 use std::io::Write;
@@ -79,7 +79,7 @@ pub fn run(
 
     // ── SHELL_BUSY: run a slow-ish command ──
     eprintln!("\n[sample-all] ── Capturing SHELL_BUSY ──");
-    let busy_msg = protocol::raw_input("agent-ctl", "ping -n 3 127.0.0.1\r");
+    let busy_msg = protocol::raw_input("agent-ctl", "ping -n 3 127.0.0.1\r", TabTarget::None);
     let _ = pipe::send_pipe_message(&s.pipe_path, &busy_msg);
     std::thread::sleep(Duration::from_secs(1));
     if let Some(sample) = capture(backend, session_hint, "shell_busy", "SHELL_BUSY")? {
@@ -94,11 +94,11 @@ pub fn run(
 
         // Launch agent
         eprintln!("[sample-all] Launching {}...", agent);
-        let launch_msg = protocol::raw_input("agent-ctl", &format!("bash\r"));
+        let launch_msg = protocol::raw_input("agent-ctl", &format!("bash\r"), TabTarget::None);
         let _ = pipe::send_pipe_message(&s.pipe_path, &launch_msg);
         std::thread::sleep(Duration::from_secs(1));
 
-        let agent_cmd = protocol::raw_input("agent-ctl", &format!("{}\r", agent));
+        let agent_cmd = protocol::raw_input("agent-ctl", &format!("{}\r", agent), TabTarget::None);
         let _ = pipe::send_pipe_message(&s.pipe_path, &agent_cmd);
 
         // ── AGENT_STARTING: capture quickly before it finishes loading ──
